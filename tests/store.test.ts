@@ -1,0 +1,281 @@
+import { readFileSync } from "fs";
+import { describe, expect, it } from "vitest";
+import {
+	CHUNK_SIZE,
+	ChunkAdapter,
+	migrateLegacySnapshot,
+} from "../src/storage/chunk-vfs";
+import { MetricsStore } from "../src/storage/store";
+
+const WASM = readFileSync("node_modules/wa-sqlite/dist/wa-sqlite-async.wasm");
+const NAME = "__name__";
+
+export interface FakeAdapter extends ChunkAdapter {
+	files: Map<string, ArrayBuffer | string>;
+	dirs: Set<string>;
+}
+
+function makeAdapter(): FakeAdapter {
+	const files = new Map<string, ArrayBuffer | string>();
+	const dirs = new Set<string>();
+	return {
+		files,
+		dirs,
+		exists: async (path) => files.has(path) || dirs.has(path),
+		mkdir: async (path) => {
+			dirs.add(path);
+		},
+		read: async (path) => {
+			const value = files.get(path);
+			if (typeof value !== "string") throw new Error("ENOENT: " + path);
+			return value;
+		},
+		write: async (path, data) => {
+			files.set(path, data);
+		},
+		readBinary: async (path) => {
+			const value = files.get(path);
+			if (!(value instanceof ArrayBuffer)) throw new Error("ENOENT: " + path);
+			return value.slice(0);
+		},
+		writeBinary: async (path, data) => {
+			files.set(path, data.slice(0));
+		},
+		remove: async (path) => {
+			files.delete(path);
+		},
+	};
+}
+
+async function openStore(adapter: FakeAdapter = makeAdapter()) {
+	const store = await MetricsStore.open({
+		adapter,
+		directory: "tsdb",
+		wasmBinary: WASM,
+	});
+	return { store, adapter };
+}
+
+describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
+	it("round-trips samples through ingest/select", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "m", job: "a" }, ts: 1000, value: 1 },
+			{ labels: { [NAME]: "m", job: "a" }, ts: 2000, value: 2 },
+			{ labels: { [NAME]: "m", job: "b" }, ts: 1500, value: 5 },
+		]);
+
+		const all = await store.select(
+			[{ name: NAME, op: "=", value: "m" }],
+			0,
+			10_000
+		);
+		expect(all).toHaveLength(2);
+
+		const onlyA = await store.select(
+			[
+				{ name: NAME, op: "=", value: "m" },
+				{ name: "job", op: "=", value: "a" },
+			],
+			0,
+			10_000
+		);
+		expect(onlyA).toHaveLength(1);
+		expect(onlyA[0].points).toEqual([
+			{ t: 1000, v: 1 },
+			{ t: 2000, v: 2 },
+		]);
+		await store.close();
+	});
+
+	it("supports regex matchers and time-range filtering", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "http_total", code: "200" }, ts: 1000, value: 1 },
+			{ labels: { [NAME]: "http_total", code: "500" }, ts: 1000, value: 2 },
+			{ labels: { [NAME]: "http_total", code: "503" }, ts: 9000, value: 3 },
+		]);
+
+		const errors = await store.select(
+			[
+				{ name: NAME, op: "=", value: "http_total" },
+				{ name: "code", op: "=~", value: "5.." },
+			],
+			0,
+			10_000
+		);
+		expect(errors).toHaveLength(2);
+
+		const windowed = await store.select(
+			[{ name: NAME, op: "=", value: "http_total" }],
+			0,
+			5000
+		);
+		expect(windowed).toHaveLength(2);
+		await store.close();
+	});
+
+	it("lists label names and values", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "m", job: "a", zone: "eu" }, ts: 1, value: 1 },
+			{ labels: { [NAME]: "n", job: "b" }, ts: 1, value: 1 },
+		]);
+		expect(await store.labelNames()).toEqual([NAME, "job", "zone"]);
+		expect(await store.labelValues("job")).toEqual(["a", "b"]);
+		expect(
+			await store.labelValues("job", [{ name: NAME, op: "=", value: "m" }])
+		).toEqual(["a"]);
+		await store.close();
+	});
+
+	it("prunes old samples and empty series", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "old" }, ts: 1000, value: 1 },
+			{ labels: { [NAME]: "new" }, ts: 9000, value: 1 },
+		]);
+		await store.deleteBefore(5000);
+		expect((await store.stats()).sampleCount).toBe(1);
+		expect(await store.seriesMatching([])).toEqual([{ [NAME]: "new" }]);
+		await store.close();
+	});
+
+	it("persists across close and reopen on the same adapter files", async () => {
+		const adapter = makeAdapter();
+		const first = await openStore(adapter);
+		await first.store.ingest([
+			{ labels: { [NAME]: "m" }, ts: 1234, value: 42 },
+		]);
+		await first.store.close();
+
+		// Chunk + meta files must exist on "disk" now.
+		expect(adapter.files.has("tsdb/metrics.meta")).toBe(true);
+		expect(adapter.files.has("tsdb/metrics.c0")).toBe(true);
+
+		const second = await openStore(adapter);
+		const data = await second.store.select(
+			[{ name: NAME, op: "=", value: "m" }],
+			0,
+			9999
+		);
+		expect(data).toHaveLength(1);
+		expect(data[0].points[0]).toEqual({ t: 1234, v: 42 });
+		await second.store.close();
+	});
+
+	it("recovers from corrupt database chunks by starting fresh", async () => {
+		const adapter = makeAdapter();
+		adapter.dirs.add("tsdb");
+		adapter.files.set("tsdb/metrics.meta", JSON.stringify({ size: 8192 }));
+		const garbage = new Uint8Array(CHUNK_SIZE);
+		garbage.fill(0xab);
+		adapter.files.set("tsdb/metrics.c0", garbage.buffer.slice(0));
+
+		const { store } = await openStore(adapter);
+		expect((await store.stats()).sampleCount).toBe(0);
+		await store.close();
+	});
+
+	it("drops NaN values and overwrites duplicate timestamps", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "m" }, ts: 1000, value: NaN },
+			{ labels: { [NAME]: "m" }, ts: 2000, value: 1 },
+			{ labels: { [NAME]: "m" }, ts: 2000, value: 2 },
+		]);
+		const data = await store.select(
+			[{ name: NAME, op: "=", value: "m" }],
+			0,
+			9999
+		);
+		expect(data[0].points).toEqual([{ t: 2000, v: 2 }]);
+		await store.close();
+	});
+
+	it("serializes concurrent operations (Asyncify forbids reentrancy)", async () => {
+		const { store } = await openStore();
+		const batch = (name: string, base: number) =>
+			Array.from({ length: 50 }, (_, i) => ({
+				labels: { [NAME]: name },
+				ts: base + i * 1000,
+				value: i,
+			}));
+		// Fire overlapping transactions and reads without awaiting in between —
+		// this reproduced "cannot start a transaction within a transaction"
+		// and subsequent wasm traps before the op queue existed.
+		await Promise.all([
+			store.ingest(batch("a", 0)),
+			store.deleteBefore(-1),
+			store.ingest(batch("b", 0)),
+			store.select([{ name: NAME, op: "=", value: "a" }], 0, 1e9),
+			store.stats(),
+			store.ingest(batch("c", 0)),
+			store.deleteBefore(-1),
+		]);
+		const stats = await store.stats();
+		expect(stats.sampleCount).toBe(150);
+		expect(stats.seriesCount).toBe(3);
+		await store.close();
+	});
+
+	it("handles a multi-chunk database (spans chunk boundaries)", async () => {
+		const { store } = await openStore();
+		// ~200 series × 50 samples ≈ enough pages to cross 64 KiB chunks.
+		const batch = [];
+		for (let s = 0; s < 200; s++) {
+			for (let i = 0; i < 50; i++) {
+				batch.push({
+					labels: { [NAME]: "bulk", idx: String(s) },
+					ts: i * 1000,
+					value: s + i,
+				});
+			}
+		}
+		await store.ingest(batch);
+		const stats = await store.stats();
+		expect(stats.sampleCount).toBe(10_000);
+		expect(stats.seriesCount).toBe(200);
+		const one = await store.select(
+			[
+				{ name: NAME, op: "=", value: "bulk" },
+				{ name: "idx", op: "=", value: "137" },
+			],
+			0,
+			60_000
+		);
+		expect(one[0].points).toHaveLength(50);
+		await store.close();
+	});
+});
+
+describe("migrateLegacySnapshot", () => {
+	it("re-chunks a legacy whole-file snapshot and removes it", async () => {
+		const adapter = makeAdapter();
+		const legacy = new Uint8Array(CHUNK_SIZE + 1234);
+		for (let i = 0; i < legacy.length; i++) legacy[i] = i % 251;
+		adapter.files.set("plugin/metrics.db", legacy.buffer.slice(0));
+
+		const migrated = await migrateLegacySnapshot(
+			adapter,
+			"plugin/metrics.db",
+			"tsdb",
+			"metrics"
+		);
+		expect(migrated).toBe(true);
+		expect(adapter.files.has("plugin/metrics.db")).toBe(false);
+		expect(JSON.parse(adapter.files.get("tsdb/metrics.meta") as string)).toEqual(
+			{ size: legacy.length }
+		);
+		const chunk0 = new Uint8Array(
+			adapter.files.get("tsdb/metrics.c0") as ArrayBuffer
+		);
+		expect(chunk0[100]).toBe(100 % 251);
+		expect(adapter.files.has("tsdb/metrics.c1")).toBe(true);
+
+		// Second run is a no-op.
+		expect(
+			await migrateLegacySnapshot(adapter, "plugin/metrics.db", "tsdb", "metrics")
+		).toBe(false);
+	});
+});
