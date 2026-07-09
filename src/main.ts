@@ -217,15 +217,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				new Notice("All custom metrics cleared");
 			},
 		});
-		this.addCommand({
-			id: "flush-metrics-db",
-			name: "Clear committed recovery log",
-			callback: async () => {
-				await this.flushStore();
-				new Notice("Committed recovery log cleared");
-			},
-		});
-
 		this.addSettingTab(new MetricsSettingTab(this.app, this));
 		new TimeSelectorController(this, this.timeContext);
 
@@ -593,9 +584,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private updateStatusBar(): void {
 		if (!this.statusBarEl) return;
 		const port = this.boundPort;
-		this.statusBarEl.textContent = `Metrics: ${
-			port !== null ? `Running:${port}` : "Stopped"
-		}`;
+		this.statusBarEl.style.display = port !== null ? "" : "none";
+		this.statusBarEl.textContent = port !== null ? `TSDB API: ${port}` : "";
 	}
 
 	async loadSettings() {

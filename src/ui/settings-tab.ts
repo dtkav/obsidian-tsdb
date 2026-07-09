@@ -1,10 +1,4 @@
-import {
-	App,
-	Notice,
-	PluginSettingTab,
-	Setting,
-	SettingGroup,
-} from "obsidian";
+import { App, PluginSettingTab, Setting, SettingGroup } from "obsidian";
 import uPlot from "uplot";
 import type ObsidianMetricsPlugin from "../main";
 import { alignMatrix, formatUnitValue } from "../panels/data";
@@ -28,10 +22,9 @@ export class MetricsSettingTab extends PluginSettingTab {
 		this.destroySparkline();
 
 		this.displayStatusHeader(containerEl, sparklineRenderId);
-		this.displayStoreGroups(containerEl);
+		this.displaySourcesGroup(containerEl);
 		this.displayDatabaseGroup(containerEl);
 		this.displayServerGroup(containerEl);
-		this.displayScrapingGroup(containerEl);
 		this.displayAdvancedGroup(containerEl);
 	}
 
@@ -90,24 +83,13 @@ export class MetricsSettingTab extends PluginSettingTab {
 		const port = this.plugin.boundPort;
 
 		const headline = main.createDiv({ cls: "omx-settings-status-headline" });
-		this.healthDot(headline, port !== null);
-		headline.createSpan({
-			text:
-				port !== null
-					? `Serving on port ${port}`
-					: this.plugin.settings.serverConfig.enabled
-					? "Server enabled, not running"
-					: "Server off",
-		});
-		if (port === null && this.plugin.settings.serverConfig.enabled) {
-			const retry = headline.createEl("button", { text: "Retry" });
-			retry.onclick = async () => {
-				await this.plugin.startMetricsServer();
-				this.display();
-			};
-		}
+		headline.createSpan({ text: "Time-series database" });
 
 		if (port !== null) {
+			main.createDiv({
+				cls: "omx-settings-status-api",
+				text: `TSDB API: ${port}`,
+			});
 			const links = main.createDiv({ cls: "omx-settings-status-links" });
 			const base = `http://localhost:${port}`;
 			links.createEl("a", {
@@ -208,47 +190,39 @@ export class MetricsSettingTab extends PluginSettingTab {
 		}
 	}
 
-	// -- per-store groups --------------------------------------------------------
+	// -- sources -----------------------------------------------------------------
 
-	private displayStoreGroups(containerEl: HTMLElement): void {
-		for (const source of this.plugin.listMetricSources()) {
+	private displaySourcesGroup(containerEl: HTMLElement): void {
+		const sources = this.plugin.listMetricSources();
+
+		const group = new SettingGroup(containerEl)
+			.addClass("omx-settings-group")
+			.setHeading("Sources");
+		this.hint(
+			group,
+			"Metric sources recorded into this vault's time-series database."
+		);
+
+		const overrides = this.plugin.settings.scrape.stores;
+		for (const source of sources) {
 			const title = this.sourceTitle(source);
-			const overrides = this.plugin.settings.scrape.stores;
-
-			const group = new SettingGroup(containerEl)
-				.addClass("omx-settings-group")
-				.setHeading(
-					this.headingWithDot(
-						title,
-						source.enabled ? this.statusFor(source.name) : null
-					)
-				);
-			if (source.description) this.hint(group, source.description);
-
 			group.addSetting((setting) => {
+				this.healthDot(
+					setting.nameEl,
+					source.enabled ? this.statusFor(source.name) : null
+				);
+				setting.nameEl.createSpan({ text: title });
+				const description = [
+					source.description,
+					source.enabled
+						? `Recording every ${source.intervalSeconds}s into this vault's database`
+						: "Not recording",
+				]
+					.filter(Boolean)
+					.join(" - ");
 				setting
-					.setName("Record")
-					.setDesc(
-						source.enabled
-							? `Recording every ${source.intervalSeconds}s into this vault's database`
-							: "Not recording"
-					)
-					.addToggle((toggle) =>
-						toggle.setValue(source.enabled).onChange(async (value) => {
-							overrides[source.name] = {
-								...overrides[source.name],
-								enabled: value,
-							};
-							await this.plugin.saveSettings();
-							this.plugin.restartScraper();
-							this.display();
-						})
-					);
-			});
-
-			if (source.enabled) {
-				group.addSetting((setting) => {
-					setting.setName("Interval (seconds)").addText((text) =>
+					.setDesc(description)
+					.addText((text) => {
 						text
 							.setPlaceholder(String(source.intervalSeconds))
 							.setValue(String(source.intervalSeconds))
@@ -262,11 +236,48 @@ export class MetricsSettingTab extends PluginSettingTab {
 									await this.plugin.saveSettings();
 									this.plugin.restartScraper();
 								}
-							})
-					);
-				});
-			}
+							});
+						text.inputEl.addClass("tsdb-interval-input");
+						text.inputEl.disabled = !source.enabled;
+					})
+					.addToggle((toggle) => {
+						toggle.setValue(source.enabled).onChange(async (value) => {
+							overrides[source.name] = {
+								...overrides[source.name],
+								enabled: value,
+							};
+							await this.plugin.saveSettings();
+							this.plugin.restartScraper();
+							this.display();
+						});
+					});
+			});
 		}
+
+		group.listEl.createDiv({
+			cls: "omx-section-hint omx-section-subhead",
+			text: "Prometheus scrape targets",
+		});
+
+		this.plugin.settings.scrape.jobs.forEach((job, index) => {
+			group.addSetting((setting) => this.configureScrapeJob(setting, job, index));
+		});
+
+		group.addSetting((setting) => {
+			setting.setName("Add Prometheus scrape target").addButton((button) =>
+				button.setButtonText("Add").onClick(async () => {
+					this.plugin.settings.scrape.jobs.push({
+						jobName: `job_${this.plugin.settings.scrape.jobs.length + 1}`,
+						targets: [],
+						intervalSeconds: 30,
+						timeoutSeconds: 10,
+						enabled: true,
+					});
+					await this.plugin.saveSettings();
+					this.display();
+				})
+			);
+		});
 	}
 
 	// -- database -----------------------------------------------------------------
@@ -323,9 +334,15 @@ export class MetricsSettingTab extends PluginSettingTab {
 	// -- http api -----------------------------------------------------------------
 
 	private displayServerGroup(containerEl: HTMLElement): void {
+		const serverStatus =
+			this.plugin.boundPort !== null
+				? true
+				: this.plugin.settings.serverConfig.enabled
+				? false
+				: null;
 		const group = new SettingGroup(containerEl)
 			.addClass("omx-settings-group")
-			.setHeading(this.headingWithDot("HTTP API", this.plugin.boundPort !== null));
+			.setHeading(this.headingWithDot("HTTP API", serverStatus));
 		this.hint(
 			group,
 			"Optional: serve this vault's metrics to Grafana, curl, or Prometheus-compatible tools."
@@ -398,38 +415,6 @@ export class MetricsSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						})
 				);
-		});
-	}
-
-	// -- scraping ------------------------------------------------------------------
-
-	private displayScrapingGroup(containerEl: HTMLElement): void {
-		const group = new SettingGroup(containerEl)
-			.addClass("omx-settings-group")
-			.setHeading("Scraping");
-		this.hint(
-			group,
-			"External Prometheus endpoints to collect, e.g. a node_exporter."
-		);
-
-		this.plugin.settings.scrape.jobs.forEach((job, index) => {
-			group.addSetting((setting) => this.configureScrapeJob(setting, job, index));
-		});
-
-		group.addSetting((setting) => {
-			setting.setName("Add scrape target").addButton((button) =>
-				button.setButtonText("Add").onClick(async () => {
-					this.plugin.settings.scrape.jobs.push({
-						jobName: `job_${this.plugin.settings.scrape.jobs.length + 1}`,
-						targets: [],
-						intervalSeconds: 30,
-						timeoutSeconds: 10,
-						enabled: true,
-					});
-					await this.plugin.saveSettings();
-					this.display();
-				})
-			);
 		});
 	}
 
@@ -518,29 +503,15 @@ export class MetricsSettingTab extends PluginSettingTab {
 			setting
 				.setName("Metric name prefix")
 				.setDesc("Applied to every metric created in this vault")
-				.addText((text) =>
+				.addText((text) => {
 					text
 						.setPlaceholder("obsidian_")
 						.setValue(this.plugin.settings.customMetricsPrefix)
 						.onChange(async (value) => {
 							this.plugin.settings.customMetricsPrefix = value;
 							await this.plugin.saveSettings();
-						})
-				);
-		});
-
-		group.addSetting((setting) => {
-			setting
-				.setName("Clear committed recovery log now")
-				.setDesc(
-					"Removes recovery entries that are already covered by committed database writes"
-				)
-				.addButton((button) =>
-					button.setButtonText("Clear").onClick(async () => {
-						await this.plugin.flushStore();
-						new Notice("Committed recovery log cleared");
-					})
-				);
+						});
+				});
 		});
 	}
 }

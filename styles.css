@@ -434,6 +434,12 @@
 	overflow-wrap: anywhere;
 }
 
+.omx-settings-status-api {
+	margin-top: 6px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
 .omx-settings-sparkline {
 	flex: 0 1 240px;
 	min-width: 180px;
@@ -515,6 +521,15 @@
 .omx-section-hint {
 	font-size: 12px;
 	color: var(--text-muted);
+}
+
+.omx-section-subhead {
+	margin-top: 8px;
+	color: var(--text-faint);
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
 }
 
 .tsdb-target-input {
