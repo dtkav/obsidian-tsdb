@@ -197,11 +197,13 @@ export class MetricsDashboardView extends ItemView {
 					this.removeChild(renderScope);
 				}
 			}
-		} catch (error: any) {
+		} catch (error) {
 			if (openId !== this.openId || !container.isConnected) return;
 			container.createDiv({
 				cls: "omx-panel-error",
-				text: `Could not load metrics dashboard: ${error?.message ?? error}`,
+				text: `Could not load metrics dashboard: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
 			});
 		}
 	}
@@ -221,10 +223,10 @@ export async function openMetricsDashboard(
 		METRICS_DASHBOARD_VIEW_TYPE
 	);
 	if (existing.length > 0) {
-		plugin.app.workspace.revealLeaf(existing[0]);
+		void plugin.app.workspace.revealLeaf(existing[0]);
 		return;
 	}
 	const leaf = plugin.app.workspace.getLeaf(true);
 	await leaf.setViewState({ type: METRICS_DASHBOARD_VIEW_TYPE, active: true });
-	plugin.app.workspace.revealLeaf(leaf);
+	void plugin.app.workspace.revealLeaf(leaf);
 }

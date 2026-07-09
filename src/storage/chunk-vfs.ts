@@ -74,8 +74,11 @@ export class AdapterChunkVFS extends VFS.Base {
 	private async readMetaSize(name: string): Promise<number | null> {
 		if (!(await this.adapter.exists(this.metaPath(name)))) return null;
 		try {
-			const meta = JSON.parse(await this.adapter.read(this.metaPath(name)));
-			return typeof meta.size === "number" ? meta.size : 0;
+			const meta = JSON.parse(
+				await this.adapter.read(this.metaPath(name))
+			) as { size?: unknown };
+			const size = meta.size;
+			return typeof size === "number" ? size : 0;
 		} catch {
 			return null;
 		}

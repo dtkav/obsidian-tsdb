@@ -12,7 +12,7 @@ import {
 
 export class MetricsManager implements MetricsRegistry {
 	private registry: client.Registry;
-	private metrics: Map<string, client.Metric<any>>;
+	private metrics: Map<string, client.Metric<string>>;
 	private prefix: string;
 
 	constructor(prefix: string = 'obsidian_') {
@@ -229,7 +229,7 @@ export class MetricsManager implements MetricsRegistry {
 
 		// Return a wrapper that provides the MetricInstance interface
 		if (metric instanceof client.Counter) {
-			const counter = metric as client.Counter<string>;
+			const counter = metric;
 			return {
 				inc: (value?: number, labels?: MetricLabels) => {
 					if (labels) {
@@ -256,7 +256,7 @@ export class MetricsManager implements MetricsRegistry {
 		}
 
 		if (metric instanceof client.Gauge) {
-			const gauge = metric as client.Gauge<string>;
+			const gauge = metric;
 			return {
 				inc: (value?: number, labels?: MetricLabels) => {
 					if (labels) {
@@ -295,7 +295,7 @@ export class MetricsManager implements MetricsRegistry {
 		}
 
 		if (metric instanceof client.Histogram) {
-			const histogram = metric as client.Histogram<string>;
+			const histogram = metric;
 			return {
 				inc: () => { throw new Error('Histogram does not support inc'); },
 				dec: () => { throw new Error('Histogram does not support dec'); },
@@ -328,7 +328,7 @@ export class MetricsManager implements MetricsRegistry {
 		}
 
 		if (metric instanceof client.Summary) {
-			const summary = metric as client.Summary<string>;
+			const summary = metric;
 			return {
 				inc: () => { throw new Error('Summary does not support inc'); },
 				dec: () => { throw new Error('Summary does not support dec'); },

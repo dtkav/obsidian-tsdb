@@ -156,7 +156,7 @@ export class ObsidianMetricsAPI implements IObsidianMetricsAPI {
 
 		try {
 			timerEnd = metric.startTimer();
-		} catch (e) {
+		} catch {
 			// Fallback for metrics that don't support timing
 		}
 
@@ -169,7 +169,7 @@ export class ObsidianMetricsAPI implements IObsidianMetricsAPI {
 				// Fallback: manually observe the duration
 				try {
 					metric.observe(duration / 1000); // Convert to seconds
-				} catch (e) {
+				} catch {
 					// If observe doesn't work, this metric type doesn't support timing
 					console.warn(`Metric ${metricName} does not support timing operations`);
 				}

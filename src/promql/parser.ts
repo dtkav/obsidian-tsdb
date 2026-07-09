@@ -263,7 +263,7 @@ class Parser {
 		if (token.type === "op" && (token.text === "-" || token.text === "+")) {
 			this.next();
 			const expr = this.parseUnary();
-			return { kind: "unary", op: token.text as "-" | "+", expr };
+			return { kind: "unary", op: token.text, expr };
 		}
 		return this.parsePostfix(this.parsePrimary());
 	}
@@ -274,7 +274,7 @@ class Parser {
 			if (token.type === "lbracket") {
 				this.next();
 				const duration = this.expect("duration", "a duration");
-				if ((this.peek() as Token).type === "colon") {
+				if (this.peek().type === "colon") {
 					throw new PromQLError("subqueries are not supported by this engine");
 				}
 				this.expect("rbracket", '"]"');

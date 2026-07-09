@@ -106,7 +106,7 @@ export class MetricsStore {
 	static async open(options: OpenOptions): Promise<MetricsStore> {
 		const dbName = options.dbName ?? DEFAULT_DB_NAME;
 		const openOnce = async (): Promise<MetricsStore> => {
-			const module = await SQLiteAsyncESMFactory(
+			const module: unknown = await SQLiteAsyncESMFactory(
 				options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}
 			);
 			const sqlite3 = SQLite.Factory(module);
@@ -166,7 +166,7 @@ export class MetricsStore {
 			(row) => {
 				const cached: CachedSeries = {
 					id: row[0] as number,
-					labels: JSON.parse(row[2] as string),
+					labels: JSON.parse(row[2] as string) as Labels,
 				};
 				this.seriesByKey.set(row[1] as string, cached);
 				this.allSeries.push(cached);

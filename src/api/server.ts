@@ -100,10 +100,11 @@ export class ApiServer {
 			try {
 				await this.listen(port);
 				return port;
-			} catch (error: any) {
+			} catch (error: unknown) {
 				lastError = error;
 				// Only walk the range for "port taken" style errors.
-				if (error?.code !== "EADDRINUSE" && error?.code !== "EACCES") {
+				const code = (error as NodeJS.ErrnoException | undefined)?.code;
+				if (code !== "EADDRINUSE" && code !== "EACCES") {
 					throw error;
 				}
 			}
@@ -155,7 +156,7 @@ export class ApiServer {
 			if (contentType.includes("application/x-www-form-urlencoded")) {
 				const body = await new Promise<string>((resolve, reject) => {
 					const chunks: Buffer[] = [];
-					req.on("data", (chunk) => chunks.push(chunk));
+					req.on("data", (chunk: Buffer) => chunks.push(chunk));
 					req.on("end", () =>
 						resolve(Buffer.concat(chunks).toString("utf8"))
 					);

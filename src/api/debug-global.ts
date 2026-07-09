@@ -41,6 +41,12 @@ export interface MetricsDebugGlobal {
 	): Promise<ApiResultData>;
 }
 
+declare global {
+	interface Window {
+		[METRICS_DEBUG_GLOBAL]?: MetricsDebugGlobal;
+	}
+}
+
 /** Install the global; returns an uninstaller safe to call on unload. */
 export function installMetricsGlobal(
 	plugin: ObsidianMetricsPlugin
@@ -58,7 +64,7 @@ export function installMetricsGlobal(
 			const port = plugin.boundPort;
 			return {
 				vault: plugin.app.vault.getName(),
-				vaultId: (plugin.app as any).appId ?? null,
+				vaultId: plugin.app.appId ?? null,
 				pluginVersion: plugin.manifest.version,
 				serverRunning: plugin.serverRunning,
 				port,
@@ -74,10 +80,10 @@ export function installMetricsGlobal(
 			requireEngine().rangeQuery(expr, startMs, endMs, stepMs),
 	};
 
-	(window as any)[METRICS_DEBUG_GLOBAL] = api;
+	window[METRICS_DEBUG_GLOBAL] = api;
 	return () => {
-		if ((window as any)[METRICS_DEBUG_GLOBAL]?.__owner === plugin) {
-			delete (window as any)[METRICS_DEBUG_GLOBAL];
+		if (window[METRICS_DEBUG_GLOBAL]?.__owner === plugin) {
+			delete window[METRICS_DEBUG_GLOBAL];
 		}
 	};
 }

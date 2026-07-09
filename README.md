@@ -22,7 +22,7 @@ An Obsidian plugin that turns your vault into a self-contained metrics station: 
 1. Clone this repository into your `.obsidian/plugins/` folder:
    ```bash
    cd /path/to/your/vault/.obsidian/plugins/
-   git clone https://github.com/yourusername/obsidian-tsdb.git
+   git clone https://github.com/dtkav/obsidian-tsdb.git
    ```
 
 2. Install dependencies and build:

@@ -67,9 +67,25 @@ export const DEFAULT_SETTINGS: ObsidianMetricsSettings = {
 	onboarded: false,
 };
 
+/**
+ * Persisted settings as they may appear on disk: any field can be missing or
+ * predate a newer schema, so every level is optional. Stored scrape overrides
+ * keep their full value shape; job entries may be partially populated.
+ */
+interface LoadedSettings {
+	serverConfig?: Partial<MetricsServerConfig>;
+	customMetricsPrefix?: string;
+	scrape?: {
+		stores?: Record<string, StoreSettings>;
+		jobs?: Partial<ScrapeJobSettings>[];
+	};
+	storage?: Partial<StorageSettings>;
+	onboarded?: boolean;
+}
+
 /** Deep-merge loaded data over defaults (loadData may predate new fields). */
 export function mergeSettings(loaded: unknown): ObsidianMetricsSettings {
-	const data = (loaded ?? {}) as Partial<ObsidianMetricsSettings>;
+	const data = (loaded ?? {}) as LoadedSettings;
 	return {
 		serverConfig: {
 			...DEFAULT_SETTINGS.serverConfig,
@@ -78,7 +94,7 @@ export function mergeSettings(loaded: unknown): ObsidianMetricsSettings {
 		customMetricsPrefix:
 			data.customMetricsPrefix ?? DEFAULT_SETTINGS.customMetricsPrefix,
 		scrape: {
-			stores: { ...(data.scrape as any)?.stores },
+			stores: { ...data.scrape?.stores },
 			jobs: (data.scrape?.jobs ?? []).map((job) => ({
 				jobName: job.jobName ?? "job",
 				targets: Array.isArray(job.targets) ? job.targets : [],
@@ -91,6 +107,6 @@ export function mergeSettings(loaded: unknown): ObsidianMetricsSettings {
 			...DEFAULT_SETTINGS.storage,
 			...(data.storage ?? {}),
 		},
-		onboarded: (data as any).onboarded ?? false,
+		onboarded: data.onboarded ?? false,
 	};
 }

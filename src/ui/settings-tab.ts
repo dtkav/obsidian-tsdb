@@ -183,7 +183,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			);
 			if (renderId !== this.sparklineRenderId || !el.isConnected) return;
 			const accent =
-				getComputedStyle(document.body)
+				getComputedStyle(activeDocument.body)
 					.getPropertyValue("--interactive-accent")
 					.trim() || "#7c6ae6";
 			const sparkline = new uPlot(
@@ -225,7 +225,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 				);
 			if (source.description) this.hint(group, source.description);
 
-			group.addSetting((setting) =>
+			group.addSetting((setting) => {
 				setting
 					.setName("Record")
 					.setDesc(
@@ -243,11 +243,11 @@ export class MetricsSettingTab extends PluginSettingTab {
 							this.plugin.restartScraper();
 							this.display();
 						})
-					)
-			);
+					);
+			});
 
 			if (source.enabled) {
-				group.addSetting((setting) =>
+				group.addSetting((setting) => {
 					setting.setName("Interval (seconds)").addText((text) =>
 						text
 							.setPlaceholder(String(source.intervalSeconds))
@@ -263,8 +263,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 									this.plugin.restartScraper();
 								}
 							})
-					)
-				);
+					);
+				});
 			}
 		}
 	}
@@ -280,7 +280,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			"History is kept in a SQLite database inside this vault's plugin folder."
 		);
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Keep history for (days)")
 				.setDesc("Older samples are pruned automatically")
@@ -295,10 +295,10 @@ export class MetricsSettingTab extends PluginSettingTab {
 								await this.plugin.saveSettings();
 							}
 						})
-				)
-		);
+				);
+		});
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Recovery log checkpoint (seconds)")
 				.setDesc(
@@ -316,8 +316,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 								this.plugin.restartMaintenanceTimers();
 							}
 						})
-				)
-		);
+				);
+		});
 	}
 
 	// -- http api -----------------------------------------------------------------
@@ -331,7 +331,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			"Optional: serve this vault's metrics to Grafana, curl, or Prometheus-compatible tools."
 		);
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Serve metrics over HTTP")
 				.setDesc("Prometheus exposition and query API for Grafana and other tools")
@@ -348,11 +348,11 @@ export class MetricsSettingTab extends PluginSettingTab {
 							}
 							this.display();
 						})
-				)
-		);
+				);
+		});
 
 		const config = this.plugin.settings.serverConfig;
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Port or port range")
 				.setDesc(
@@ -380,10 +380,10 @@ export class MetricsSettingTab extends PluginSettingTab {
 								await this.plugin.startMetricsServer();
 							}
 						})
-				)
-		);
+				);
+		});
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Metrics path")
 				.setDesc("Where the exposition page is served")
@@ -397,8 +397,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 								: "/" + value;
 							await this.plugin.saveSettings();
 						})
-				)
-		);
+				);
+		});
 	}
 
 	// -- scraping ------------------------------------------------------------------
@@ -416,7 +416,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			group.addSetting((setting) => this.configureScrapeJob(setting, job, index));
 		});
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting.setName("Add scrape target").addButton((button) =>
 				button.setButtonText("Add").onClick(async () => {
 					this.plugin.settings.scrape.jobs.push({
@@ -429,8 +429,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 					this.display();
 				})
-			)
-		);
+			);
+		});
 	}
 
 	private configureScrapeJob(
@@ -514,7 +514,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			.addClass("omx-settings-group")
 			.setHeading("Advanced");
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Metric name prefix")
 				.setDesc("Applied to every metric created in this vault")
@@ -526,10 +526,10 @@ export class MetricsSettingTab extends PluginSettingTab {
 							this.plugin.settings.customMetricsPrefix = value;
 							await this.plugin.saveSettings();
 						})
-				)
-		);
+				);
+		});
 
-		group.addSetting((setting) =>
+		group.addSetting((setting) => {
 			setting
 				.setName("Clear committed recovery log now")
 				.setDesc(
@@ -540,7 +540,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 						await this.plugin.flushStore();
 						new Notice("Committed recovery log cleared");
 					})
-				)
-		);
+				);
+		});
 	}
 }

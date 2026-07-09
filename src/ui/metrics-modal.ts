@@ -31,9 +31,11 @@ export class MetricsModal extends Modal {
 			} else {
 				statsLine.textContent = "Local metrics database not running.";
 			}
-		} catch (error: any) {
+		} catch (error) {
 			if (renderId !== this.renderId || !contentEl.isConnected) return;
-			statsLine.textContent = "Stats unavailable: " + error.message;
+			statsLine.textContent =
+				"Stats unavailable: " +
+				(error instanceof Error ? error.message : String(error));
 		}
 
 		const metricsContainer = contentEl.createDiv();
@@ -49,10 +51,12 @@ export class MetricsModal extends Modal {
 			} else {
 				metricsContainer.createEl("p", { text: "No metrics available" });
 			}
-		} catch (error: any) {
+		} catch (error) {
 			if (renderId !== this.renderId || !contentEl.isConnected) return;
 			metricsContainer.createEl("p", {
-				text: "Error loading metrics: " + error.message,
+				text:
+					"Error loading metrics: " +
+					(error instanceof Error ? error.message : String(error)),
 			});
 		}
 

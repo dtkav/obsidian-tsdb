@@ -18,7 +18,18 @@ const packageJson = readJson("package.json");
 const versions = readJson("versions.json");
 
 check(manifest.id === "tsdb", 'manifest id must be "tsdb"');
-check(manifest.name === "TSDB", 'manifest name must be "TSDB"');
+check(
+	manifest.name === "Time Series Database",
+	'manifest name must be "Time Series Database"'
+);
+check(
+	manifest.name !== manifest.name.toUpperCase(),
+	"manifest name must not be all caps"
+);
+check(
+	/[.!?]$/.test(manifest.description),
+	"manifest description must end with punctuation"
+);
 check(!/\bobsidian\b/i.test(manifest.id), "manifest id must not include Obsidian");
 check(!/\bobsidian\b/i.test(manifest.name), "manifest name must not include Obsidian");
 check(

@@ -60,7 +60,7 @@ export function fetchText(
 				return;
 			}
 			const chunks: Buffer[] = [];
-			res.on("data", (chunk) => chunks.push(chunk));
+			res.on("data", (chunk: Buffer) => chunks.push(chunk));
 			res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
 			res.on("error", reject);
 		});
@@ -154,7 +154,7 @@ export interface ScraperStatus {
  */
 export class Scraper {
 	private sink: SampleSink;
-	private timers: ReturnType<typeof setInterval>[] = [];
+	private timers: number[] = [];
 	private inFlight = new Set<string>();
 	private statuses = new Map<string, ScraperStatus>();
 	private generation = 0;
@@ -175,7 +175,7 @@ export class Scraper {
 			const run = () => void this.scrapeSelf(source, instance, generation);
 			run();
 			this.timers.push(
-				setInterval(run, Math.max(1, source.intervalSeconds) * 1000)
+				window.setInterval(run, Math.max(1, source.intervalSeconds) * 1000)
 			);
 		}
 
@@ -188,13 +188,13 @@ export class Scraper {
 			};
 			run();
 			this.timers.push(
-				setInterval(run, Math.max(5, job.intervalSeconds) * 1000)
+				window.setInterval(run, Math.max(5, job.intervalSeconds) * 1000)
 			);
 		}
 	}
 
 	stop(): void {
-		for (const timer of this.timers) clearInterval(timer);
+		for (const timer of this.timers) window.clearInterval(timer);
 		this.timers = [];
 		this.generation++;
 	}

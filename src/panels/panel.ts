@@ -6,7 +6,6 @@ import {
 	alignMatrix,
 	buildPanelLegends,
 	formatLegend,
-	formatStatValue,
 	formatUnitValue,
 } from "./data";
 
@@ -22,7 +21,7 @@ const DARK_PALETTE = [
 ];
 
 function activePalette(): string[] {
-	return document.body.classList.contains("theme-dark")
+	return activeDocument.body.classList.contains("theme-dark")
 		? DARK_PALETTE
 		: LIGHT_PALETTE;
 }
@@ -57,8 +56,8 @@ export class PromQLPanel extends MarkdownRenderChild {
 		this.containerEl.addClass("omx-panel");
 		try {
 			this.config = parsePanelConfig(this.source, parseYaml);
-		} catch (error: any) {
-			this.renderError(error?.message ?? String(error));
+		} catch (error) {
+			this.renderError(error instanceof Error ? error.message : String(error));
 			return;
 		}
 
@@ -115,12 +114,12 @@ export class PromQLPanel extends MarkdownRenderChild {
 			} else {
 				await this.renderInstant(engine, config, body);
 			}
-		} catch (error: any) {
+		} catch (error) {
 			if (this.unloaded) return;
 			body.empty();
 			body.createDiv({
 				cls: "omx-panel-error",
-				text: `query error: ${error?.message ?? String(error)}`,
+				text: `query error: ${error instanceof Error ? error.message : String(error)}`,
 			});
 		}
 	}
@@ -178,7 +177,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		this.plot?.destroy();
 		body.empty();
 
-		const styles = getComputedStyle(document.body);
+		const styles = getComputedStyle(activeDocument.body);
 		const textColor = styles.getPropertyValue("--text-muted").trim() || "#888";
 		const gridColor =
 			styles.getPropertyValue("--background-modifier-border").trim() ||

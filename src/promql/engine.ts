@@ -306,7 +306,7 @@ class Evaluator {
 				if (value.kind === "scalar") {
 					return {
 						kind: "scalar",
-						values: value.values.map((v) => -v) as Float64Array,
+						values: value.values.map((v) => -v),
 					};
 				}
 				if (value.kind === "vector") {
@@ -314,7 +314,7 @@ class Evaluator {
 						kind: "vector",
 						series: value.series.map((s) => ({
 							labels: withoutName(s.labels),
-							values: s.values.map((v) => -v) as Float64Array,
+							values: s.values.map((v) => -v),
 						})),
 					};
 				}
@@ -452,7 +452,7 @@ class Evaluator {
 					labels: withoutName(s.labels),
 					values: s.values.map((v) =>
 						Number.isNaN(v) ? NaN : mathFn(v)
-					) as Float64Array,
+					),
 				})),
 			};
 		}
@@ -473,7 +473,7 @@ class Evaluator {
 						labels: withoutName(s.labels),
 						values: s.values.map((v, i) =>
 							Number.isNaN(v) ? NaN : Math.round(v / nearest[i]) * nearest[i]
-						) as Float64Array,
+						),
 					})),
 				};
 			}
@@ -500,7 +500,7 @@ class Evaluator {
 							return func === "clamp_min"
 								? Math.max(v, first[i])
 								: Math.min(v, first[i]);
-						}) as Float64Array,
+						}),
 					})),
 				};
 			}

@@ -32,6 +32,13 @@ import {
 import { MetricsModal } from "./ui/metrics-modal";
 import { MetricsSettingTab } from "./ui/settings-tab";
 
+declare module "obsidian" {
+	interface App {
+		/** Per-installation id; present at runtime but absent from the API types. */
+		appId?: string;
+	}
+}
+
 const LEGACY_DB_FILENAME = "metrics.db";
 const TSDB_DIRNAME = "metrics-tsdb";
 const WAL_FILENAME = "metrics.wal";
@@ -71,7 +78,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.sources = sources;
 		sources.setDefaultLabels({
 			vault_name: this.app.vault.getName(),
-			vault_id: (this.app as any).appId,
+			vault_id: this.app.appId ?? "",
 		});
 		const apiState: { sources: MetricSourceRegistry | null } = {
 			sources,
@@ -238,7 +245,13 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		});
 	}
 
-	async onunload() {
+	onunload() {
+		// onunload must return void (Obsidian does not await it); run the
+		// async teardown as a detached task.
+		void this.teardown();
+	}
+
+	private async teardown(): Promise<void> {
 		this.closePluginViews();
 		this.scraper?.dispose();
 		this.clearMaintenanceTimers();
@@ -281,13 +294,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		try {
 			const port = await this.apiServer.listenRange(start, end);
 			new Notice(`Metrics server started on port ${port}`);
-		} catch (error: any) {
+		} catch (error: unknown) {
 			console.warn("Metrics server failed to start:", error);
 			const range = end > start ? `ports ${start}-${end}` : `port ${start}`;
 			let message = `Metrics server disabled - ${range} not available`;
-			if (error?.code === "EADDRINUSE") {
+			const code = (error as NodeJS.ErrnoException | undefined)?.code;
+			if (code === "EADDRINUSE") {
 				message += ". Other services are using these ports.";
-			} else if (error?.code === "EACCES") {
+			} else if (code === "EACCES") {
 				message += ". Permission denied (try ports > 1024).";
 			}
 			new Notice(message + " Change port in plugin settings.", 8000);
@@ -447,7 +461,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	// -- misc ----------------------------------------------------------------
 
 	private removeStaleStatusBarItems(): void {
-		document
+		activeDocument
 			.querySelectorAll(".status-bar-item.tsdb-status")
 			.forEach((el) => el.remove());
 		this.statusBarEl = null;

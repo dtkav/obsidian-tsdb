@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Events, Plugin } from "obsidian";
 import { ObsidianMetricsAPI } from "./metrics-api";
 
 /**
@@ -50,7 +50,7 @@ export function setupVaultMetrics(
 	];
 	for (const operation of vaultOps) {
 		plugin.registerEvent(
-			(app.vault.on as any)(operation, (file: { path: string }) => {
+			(app.vault as Events).on(operation, (file: { path: string }) => {
 				if (disposed) return;
 				fileOpsCounter.inc(1, {
 					operation,
@@ -108,9 +108,13 @@ export function setupVaultMetrics(
 
 			activeNotesGauge.set(app.workspace.getLeavesOfType("markdown").length);
 
-			const enabledPlugins = (app as any).plugins?.enabledPlugins;
+			const enabledPlugins = (app as { plugins?: { enabledPlugins?: unknown } })
+				.plugins?.enabledPlugins;
 			pluginCountGauge.set(
-				enabledPlugins?.size ?? Object.keys(enabledPlugins ?? {}).length
+				enabledPlugins instanceof Set
+					? enabledPlugins.size
+					: Object.keys((enabledPlugins as Record<string, unknown>) ?? {})
+							.length
 			);
 		} catch (error) {
 			console.warn("Error updating vault metrics:", error);
@@ -163,8 +167,10 @@ export function setupPerformanceMetrics(
 
 	const updatePerformanceMetrics = () => {
 		if (disposed) return;
-		if ((performance as any).memory) {
-			memoryGauge.set((performance as any).memory.usedJSHeapSize);
+		const perfMemory = (performance as { memory?: { usedJSHeapSize: number } })
+			.memory;
+		if (perfMemory) {
+			memoryGauge.set(perfMemory.usedJSHeapSize);
 		}
 	};
 
