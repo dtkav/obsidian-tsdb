@@ -6,6 +6,7 @@ import {
 } from "../src/panels/config";
 import {
 	alignMatrix,
+	axisSizeForLabels,
 	buildPanelLegends,
 	formatLegend,
 	formatStatValue,
@@ -124,6 +125,13 @@ describe("panel data shaping", () => {
 		expect(formatUnitValue(1536, "B")).toBe("1.5 KiB");
 		expect(formatUnitValue(0.042, "s")).toBe("42 ms");
 		expect(formatUnitValue(90, "ops")).toBe("90 ops");
+	});
+
+	it("widens the y axis for long unit labels", () => {
+		expect(axisSizeForLabels(null)).toBe(70);
+		expect(axisSizeForLabels(["0", "100"])).toBe(70);
+		expect(axisSizeForLabels(["0.100 req/s"])).toBeGreaterThan(80);
+		expect(axisSizeForLabels(["1234567890123456789012345"])).toBe(140);
 	});
 
 	it("renders legend templates", () => {

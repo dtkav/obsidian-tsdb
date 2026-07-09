@@ -99,6 +99,19 @@ export function buildPanelLegends(
 
 const BYTE_UNITS = new Set(["b", "byte", "bytes"]);
 const SECOND_UNITS = new Set(["s", "sec", "secs", "second", "seconds"]);
+const MIN_AXIS_SIZE = 70;
+const MAX_AXIS_SIZE = 140;
+const AXIS_CHAR_WIDTH = 7;
+const AXIS_LABEL_PADDING = 20;
+
+export function axisSizeForLabels(labels: readonly unknown[] | null | undefined): number {
+	let longest = 0;
+	for (const label of labels ?? []) {
+		longest = Math.max(longest, String(label).length);
+	}
+	const estimated = longest * AXIS_CHAR_WIDTH + AXIS_LABEL_PADDING;
+	return Math.max(MIN_AXIS_SIZE, Math.min(MAX_AXIS_SIZE, estimated));
+}
 
 /** Unit-aware tick/stat formatting (bytes → KiB/MiB/GiB, seconds → ms). */
 export function formatUnitValue(value: number, unit?: string): string {

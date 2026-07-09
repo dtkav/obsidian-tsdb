@@ -4,6 +4,7 @@ import { ApiResultData, PromQLEngine } from "../promql/engine";
 import { PanelConfig, parsePanelConfig } from "./config";
 import {
 	alignMatrix,
+	axisSizeForLabels,
 	buildPanelLegends,
 	formatLegend,
 	formatUnitValue,
@@ -235,7 +236,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 				{ stroke: textColor, grid: { stroke: gridColor }, ticks: { stroke: gridColor } },
 				{
 					stroke: textColor,
-					size: 70,
+					size: (_u, values) => axisSizeForLabels(values),
 					grid: { stroke: gridColor },
 					ticks: { stroke: gridColor },
 					values: (_u: uPlot, ticks: number[]) =>
