@@ -1,324 +1,387 @@
 # TSDB
 
-An Obsidian plugin that turns your vault into a self-contained metrics station: it exposes metrics in Prometheus format, **scrapes and stores them in a local SQLite time-series database**, and serves a **Prometheus-compatible query API** (a subset of PromQL) that Grafana can use directly as a Prometheus datasource.
+TSDB is a local time-series database for Obsidian. It records metrics from this
+vault and from other plugins, stores them in a durable SQLite database inside
+the vault's plugin folder, and lets notes render live charts with PromQL code
+blocks.
 
-## Features
+The default path is local and offline: collect metrics, keep history, query the
+local database, and chart the results in Obsidian. Prometheus HTTP serving and
+external endpoint scraping are available under advanced settings.
 
-- **Prometheus Server**: Built-in HTTP server serving metrics in Prometheus format
-- **Metrics Scraper**: Periodically scrapes its own metrics and any external Prometheus exposition endpoints (e.g. node_exporter) into a local store
-- **Local TSDB**: Time series stored in SQLite (wa-sqlite/WASM, bundled — no native modules) through a custom VFS that writes 64 KiB chunk files via Obsidian's vault adapter, so every scrape is durable on commit and no Node file APIs are needed for storage
-- **Query API**: Prometheus-compatible `/api/v1/*` endpoints with a PromQL subset — point Grafana at `http://localhost:9090` as a Prometheus datasource
-- **TypeScript API**: Full-featured API for creating and managing metrics
-- **Multiple Metric Types**: Support for Counters, Gauges, Histograms, and Summaries
-- **Built-in Metrics**: Automatic collection of system and plugin metrics
-- **Default Labels**: All metrics automatically include `vault_name` and `vault_id` labels
-- **Plugin Integration**: Event-based API for other plugins with proper load order handling
-- **Settings Interface**: Configurable server, scraping, and storage options
+## What it does
+
+- **Local time-series database**: stores samples in SQLite through `wa-sqlite`
+  and a vault-adapter VFS, so data is persisted as chunk files without native
+  modules.
+- **Plugin metric registration**: other plugins register named metric stores
+  with `app.plugins.plugins["tsdb"].api.getStore(...)` or the `tsdb:ready`
+  workspace event.
+- **PromQL queries**: query stored metrics with a practical subset of PromQL,
+  including selectors, aggregations, rates, range functions, binary operators,
+  and `histogram_quantile`.
+- **Embedded charts**: render live time series, stat, and table panels from
+  fenced `promql` code blocks in notes.
+- **Built-in vault metrics**: records file activity, note counts, vault size,
+  enabled plugin count, open note count, note view time, and browser memory when
+  available.
+- **Prometheus interop**: optionally expose a local Prometheus-compatible HTTP
+  server and scrape Prometheus exposition endpoints into the same local store.
 
 ## Installation
 
-### Manual Installation
+### Manual installation
 
-1. Clone this repository into your `.obsidian/plugins/` folder:
+1. Clone this repository into your vault's `.obsidian/plugins/` folder:
+
    ```bash
    cd /path/to/your/vault/.obsidian/plugins/
    git clone https://github.com/dtkav/obsidian-tsdb.git
    ```
 
 2. Install dependencies and build:
+
    ```bash
    cd obsidian-tsdb
    npm install
    npm run build
    ```
 
-3. Enable the plugin in Obsidian Settings -> Community Plugins
+3. Enable **TSDB** in **Settings -> Community plugins**.
 
-## Usage
+## Time-Series Database
 
-### Basic Setup
+TSDB records metric samples into a SQLite database stored under the plugin
+folder. The database lives in `metrics-tsdb/` as 64 KiB chunks, plus a
+`metrics.wal` recovery log. Each scrape batch is committed as a SQLite
+transaction, and retention pruning removes old samples on a schedule.
 
-Once installed, the plugin will:
-- Start a Prometheus server on port 9090 (configurable)
-- Expose metrics at `http://localhost:9090/metrics`
-- Add a status indicator to the status bar
-- Provide a ribbon icon for quick access
+The local database is the center of the plugin:
 
-### API for Other Plugins
+- Built-in metric stores record this vault's own activity.
+- Plugin-provided stores record metrics from other Obsidian plugins.
+- Optional scrape jobs record external Prometheus endpoints.
+- Note charts and dashboards query the database directly, without needing the
+  HTTP server.
 
-#### Type Definitions
+The default retention is 30 days. Change it in **Settings -> Community plugins
+-> TSDB -> Database**.
 
-Copy `obsidian-metrics.d.ts` into your plugin for type-safe API access. This file contains:
-- All interface definitions (`IObsidianMetricsAPI`, `MetricInstance`, etc.)
-- Module augmentation for the `tsdb:ready` workspace event
-- Comprehensive usage documentation
+### Built-in metrics
 
-#### Accessing the API
+TSDB creates two built-in stores:
 
-```typescript
-import { IObsidianMetricsRootAPI, IObsidianMetricsAPI, MetricInstance, ObsidianMetricsPlugin } from './obsidian-metrics';
+- `vault`: file operations, note counts, vault size, open notes, enabled
+  plugins, and note view duration.
+- `performance`: browser memory usage and selected Obsidian API timings.
 
-class MyPlugin extends Plugin {
-  private metricsApi: IObsidianMetricsAPI | undefined;
-  private myGauge: MetricInstance | undefined;
+Examples:
 
-  async onload() {
-    // Listen for metrics API becoming available (handles load order and reloads)
-    this.registerEvent(
-      this.app.workspace.on('tsdb:ready', (api: IObsidianMetricsRootAPI) => {
-        this.initializeMetrics(api);
-      })
-    );
-
-    // Also try to get it immediately in case metrics plugin loaded first
-    const metricsPlugin = this.app.plugins.plugins['tsdb'] as ObsidianMetricsPlugin | undefined;
-    if (metricsPlugin?.api) {
-      this.initializeMetrics(metricsPlugin.api);
-    }
-  }
-
-  private initializeMetrics(rootApi: IObsidianMetricsRootAPI) {
-    const api = rootApi.getStore('my-plugin', {
-      intervalSeconds: 30,
-      displayName: 'My plugin metrics',
-      description: 'Document size and activity metrics.',
-    });
-    this.metricsApi = api;
-
-    // Metric creation is idempotent - safe to call multiple times
-    this.myGauge = api.createGauge({
-      name: 'my_document_size_bytes',
-      help: 'Size of documents in bytes',
-      labelNames: ['document']
-    });
-  }
-
-  updateDocumentSize(doc: string, bytes: number) {
-    this.myGauge?.labels({ document: doc }).set(bytes);
-  }
-}
-```
-
-#### Key Points
-
-- **Do NOT cache the API or metrics long-term** - they become stale if TSDB reloads
-- Listen for `tsdb:ready` and re-initialize your metrics each time it fires
-- Metric creation is idempotent: calling `createGauge()` with the same name returns the existing metric
-- All metrics automatically include `vault_name` and `vault_id` labels
-
-### Creating Metrics
-
-#### Counter (values that only increase)
-```typescript
-const pageViewCounter = api.createCounter({
-  name: 'page_views_total',
-  help: 'Total number of page views',
-  labelNames: ['page_type', 'source']
-});
-
-// Increment
-pageViewCounter.inc();
-pageViewCounter.inc(5);
-pageViewCounter.inc(1, { page_type: 'note', source: 'search' });
-
-// Or use fluent labels() API
-pageViewCounter.labels({ page_type: 'note', source: 'search' }).inc();
-```
-
-#### Gauge (values that can go up and down)
-```typescript
-const activeNotesGauge = api.createGauge({
-  name: 'active_notes_count',
-  help: 'Number of currently active notes'
-});
-
-// Set value
-activeNotesGauge.set(42);
-activeNotesGauge.inc();
-activeNotesGauge.dec(5);
-
-// With labels
-activeNotesGauge.labels({ workspace: 'main' }).set(10);
-```
-
-#### Histogram (distribution of values in buckets)
-```typescript
-const loadTimeHistogram = api.createHistogram({
-  name: 'page_load_duration_seconds',
-  help: 'Page load duration in seconds',
-  buckets: [0.1, 0.5, 1, 2, 5]
-});
-
-// Observe values
-loadTimeHistogram.observe(1.2);
-loadTimeHistogram.observe(0.8, { page_type: 'canvas' });
-
-// Time operations
-const timer = loadTimeHistogram.startTimer();
-// ... do work ...
-timer(); // Automatically observes the duration
-```
-
-#### Summary (quantiles over sliding time window)
-```typescript
-const responseSummary = api.createSummary({
-  name: 'api_response_duration_seconds',
-  help: 'API response duration in seconds',
-  percentiles: [0.5, 0.9, 0.95, 0.99]
-});
-
-responseSummary.observe(0.234);
-```
-
-### Convenience Methods
-
-```typescript
-// Quick counter creation
-const counter = api.counter('button_clicks', 'Button click count', 1);
-
-// Quick gauge creation
-const gauge = api.gauge('memory_usage', 'Memory usage in bytes', 1024);
-
-// Quick histogram creation
-const hist = api.histogram('request_duration', 'Request duration');
-```
-
-### Measuring Function Execution
-
-```typescript
-// Measure async functions
-const result = await api.measureAsync('async_operation_duration', async () => {
-  return await someAsyncOperation();
-});
-
-// Measure sync functions
-const result = api.measureSync('sync_operation_duration', () => {
-  return someCalculation();
-});
-
-// Manual timing
-const timer = api.createTimer('custom_operation_duration');
-// ... do work ...
-const durationMs = timer(); // Returns duration in milliseconds
-```
-
-## Configuration
-
-Access plugin settings through **Settings -> Community Plugins -> TSDB**
-
-### Server Configuration
-- **Enable Metrics Server**: Toggle the Prometheus server on/off
-- **Server Port or Range**: A port (`9090`) or range (`9090-9099`, the default). With a range the first free port is bound, so several vaults can run the plugin concurrently.
-- **Metrics Endpoint Path**: Configure the metrics endpoint (default: /metrics)
-
-### Port discovery over CDP
-
-Because the bound port is dynamic with a range, the plugin installs a CDP-accessible global (same convention as Relay's `window.__relayDebug`): attach to Obsidian over the Chrome DevTools Protocol, enumerate renderer targets, and evaluate in each:
-
-```js
-window.__tsdb?.getInfo()
-// { vault, vaultId, pluginVersion, serverRunning, port, metricsPath, baseUrl }
-```
-
-The global also exposes `getStats()`, `getScrapeStatuses()`, and direct PromQL access via `query(expr)` / `queryRange(expr, startMs, endMs, stepMs)` — handy for E2E tests and external tooling without going through HTTP.
-
-### Metrics Configuration
-- **Enable Built-in Metrics**: Collect real Obsidian usage metrics
-- **Custom Metrics Prefix**: Prefix for custom metrics (default: `obsidian_`)
-
-## Built-in Metrics
-
-When enabled, the plugin automatically collects:
-
-### File Operations
-- `obsidian_file_operations_total`: File operations with `operation` and `file_type` labels
-
-### Vault Statistics
-- `obsidian_vault_files_total`: Total files in vault
-- `obsidian_vault_notes_total`: Total markdown notes
-- `obsidian_vault_size_bytes`: Total vault size
-
-### Application State
-- `obsidian_active_notes_count`: Open notes/tabs
-- `obsidian_plugins_enabled_total`: Enabled plugins
-- `obsidian_note_view_duration_seconds`: Time viewing notes (histogram)
-
-### Performance
-- `obsidian_browser_memory_usage_bytes`: Browser memory usage
-- `obsidian_app_performance_timing_seconds`: App operation timings (histogram)
+- `obsidian_file_operations_total`
+- `obsidian_vault_files_total`
+- `obsidian_vault_notes_total`
+- `obsidian_vault_size_bytes`
+- `obsidian_active_notes_count`
+- `obsidian_plugins_enabled_total`
+- `obsidian_note_view_duration_seconds`
+- `obsidian_browser_memory_usage_bytes`
+- `obsidian_app_performance_timing_seconds`
 
 All metrics include `vault_name` and `vault_id` labels automatically.
 
-## Scraping & Local Storage
+## Plugin Registration
 
-The plugin doubles as a miniature Prometheus-style metrics store:
+Other plugins register metrics by claiming a named store. A store is recorded
+into the local database at its own interval, and the store name becomes the
+`job` label for stored samples.
 
-- **Self-scrape**: its own registries are recorded into the local database on an interval (default 30s), under `job="vault"` and `job="performance"`.
-- **External scrape jobs**: add jobs in settings with one or more target URLs (e.g. `http://localhost:9100/metrics` for node_exporter). Each scrape also records the synthetic `up`, `scrape_duration_seconds` and `scrape_samples_scraped` series, and `job`/`instance` labels are attached the way Prometheus does.
-- **Storage & durability**: samples live in a real SQLite database (wa-sqlite, Asyncify build) whose files are stored as 64 KiB chunk files under `metrics-tsdb/` in the plugin folder, written through Obsidian's vault adapter via a custom SQLite VFS. Every scrape batch is one committed transaction — durable immediately, with SQLite's own journal providing crash recovery; a page write rewrites one chunk, never the whole database. A secondary write-ahead log (`metrics.wal`) acts as a recovery net: entries are appended after commit, replayed idempotently on startup, and truncated on an interval. A legacy sql.js `metrics.db` snapshot is migrated automatically on first load. Retention (default 30 days) is pruned hourly.
+Copy `obsidian-metrics.d.ts` into your plugin for type-safe access.
 
-## Query API
+```typescript
+import { Plugin } from "obsidian";
+import {
+	IObsidianMetricsRootAPI,
+	IObsidianMetricsAPI,
+	MetricInstance,
+	ObsidianMetricsPlugin,
+} from "./obsidian-metrics";
 
-All endpoints live on the same port as the metrics server and follow the Prometheus HTTP API envelope, so **Grafana works out of the box**: add a Prometheus datasource with URL `http://localhost:9090`.
+export default class MyPlugin extends Plugin {
+	private metrics: IObsidianMetricsAPI | undefined;
+	private documentSize: MetricInstance | undefined;
+
+	async onload() {
+		this.registerEvent(
+			this.app.workspace.on("tsdb:ready", (api: IObsidianMetricsRootAPI) => {
+				this.registerMetrics(api);
+			})
+		);
+
+		const tsdb = this.app.plugins.plugins["tsdb"] as
+			| ObsidianMetricsPlugin
+			| undefined;
+		if (tsdb?.api) {
+			this.registerMetrics(tsdb.api);
+		}
+	}
+
+	private registerMetrics(rootApi: IObsidianMetricsRootAPI) {
+		const api = rootApi.getStore("my-plugin", {
+			intervalSeconds: 30,
+			displayName: "My plugin metrics",
+			description: "Document size and activity metrics.",
+		});
+
+		this.metrics = api;
+		this.documentSize = api.createGauge({
+			name: "my_document_size_bytes",
+			help: "Size of documents in bytes.",
+			labelNames: ["document"],
+		});
+	}
+
+	updateDocumentSize(document: string, bytes: number) {
+		this.documentSize?.labels({ document }).set(bytes);
+	}
+}
+```
+
+Registration is idempotent. If TSDB reloads, `tsdb:ready` fires again and your
+plugin should recreate its store and metric references. Do not keep old API or
+metric instances across TSDB reloads.
+
+### Metric types
+
+TSDB exposes the familiar Prometheus metric types through `prom-client`:
+
+```typescript
+const counter = api.createCounter({
+	name: "requests_total",
+	help: "Total requests.",
+	labelNames: ["route"],
+});
+counter.inc(1, { route: "search" });
+
+const gauge = api.createGauge({
+	name: "queue_depth",
+	help: "Current queue depth.",
+});
+gauge.set(12);
+
+const histogram = api.createHistogram({
+	name: "operation_duration_seconds",
+	help: "Operation duration.",
+	labelNames: ["operation"],
+	buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
+});
+const stop = histogram.startTimer({ operation: "index" });
+// do work
+stop();
+```
+
+Convenience helpers are also available:
+
+```typescript
+api.counter("button_clicks_total", "Button click count.").inc();
+api.gauge("active_documents", "Open document count.", 3);
+api.histogram("request_duration_seconds", "Request duration.");
+```
+
+## Charting In Notes
+
+TSDB registers a `promql` Markdown code block processor. Add a fenced block to
+any note and it renders as a live panel backed by the local database.
+
+### Time series
+
+````markdown
+```promql
+query: sum by (operation) (rate(obsidian_file_operations_total[5m]))
+title: File operations per second
+legend: "{{operation}}"
+range: 3h
+refresh: 30s
+```
+````
+
+### Stat
+
+````markdown
+```promql
+query: obsidian_vault_notes_total
+type: stat
+title: Notes
+refresh: 60s
+```
+````
+
+### Table
+
+````markdown
+```promql
+query: scrape_samples_scraped
+type: table
+title: Scrape samples
+refresh: 30s
+```
+````
+
+Panel options:
+
+- `query`: a PromQL expression.
+- `queries`: multiple expressions with optional `legend` values.
+- `type`: `timeseries`, `stat`, or `table`.
+- `title`: panel title.
+- `range`: time range for time series panels, such as `1h` or `3h`.
+- `step`: query step; omitted means automatic.
+- `refresh`: refresh interval; omitted means render once.
+- `unit`: display unit, including `bytes`.
+- `legend`: label template such as `{{operation}} on {{instance}}`.
+- `min`, `max`, `height`: chart display controls.
+
+Use the ribbon icon or the **Open metrics dashboard** command to open the
+built-in dashboard. Select **Edit in my vault** from that dashboard to create a
+normal Markdown note you can customize.
+
+## Querying
+
+The charting layer and dashboard query the local TSDB directly. The same engine
+also powers the optional Prometheus-compatible HTTP API.
+
+Supported PromQL subset:
+
+- Selectors with `=`, `!=`, `=~`, `!~`, range selectors such as `[5m]`, and
+  `offset`.
+- `rate`, `irate`, `increase`, `delta`, `idelta`, `changes`, `resets`, and
+  `*_over_time` functions for avg, min, max, sum, count, last, present,
+  stddev, stdvar, and quantile.
+- `histogram_quantile`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
+  `log2`, `log10`, `sgn`, `clamp`, `clamp_min`, `clamp_max`, `scalar`,
+  `vector`, `time`, `absent`, `sort`, and `sort_desc`.
+- Aggregations: `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`,
+  `quantile`, `topk`, and `bottomk` with `by` and `without`.
+- Binary operators: arithmetic, comparisons including `bool`, `and`, `or`,
+  `unless`, and one-to-one vector matching with `on` and `ignoring`.
+
+Not supported yet: subqueries, `@` modifiers, `group_left`, `group_right`,
+`label_replace`, and `label_join`.
+
+## Settings
+
+Open **Settings -> Community plugins -> TSDB**.
+
+Key settings:
+
+- **Metric stores**: enable or disable each local store and set its recording
+  interval.
+- **Database**: set retention and recovery log checkpoint interval.
+- **HTTP API**: enable the local Prometheus-compatible server and set the port
+  or port range.
+- **Scraping**: add external Prometheus exposition targets.
+- **Advanced**: set the metric prefix and clear the committed recovery log.
+
+The HTTP server is disabled by default. Local recording and note charting do
+not require it.
+
+## Advanced: Prometheus Interop
+
+TSDB can both expose a Prometheus-compatible server and scrape Prometheus
+endpoints. These features are optional and use local HTTP by default.
+
+### Expose a Prometheus server
+
+Enable **Serve metrics over HTTP** in settings to bind a local server. The
+default port range is `9090-9099`, so several vaults can run at the same time.
+
+Available endpoints:
 
 | Endpoint | Notes |
-|---|---|
-| `/api/v1/query` | instant queries (`query`, `time`) |
-| `/api/v1/query_range` | range queries (`query`, `start`, `end`, `step`) |
-| `/api/v1/series` | `match[]` selectors |
-| `/api/v1/labels`, `/api/v1/label/<name>/values` | label discovery |
-| `/api/v1/status/buildinfo`, `/api/v1/status/tsdb` | status/feature probes |
+| --- | --- |
+| `/metrics` | Prometheus text exposition for current in-process metrics |
+| `/health` and `/-/healthy` | Health checks |
+| `/api/v1/query` | Instant queries with `query` and optional `time` |
+| `/api/v1/query_range` | Range queries with `query`, `start`, `end`, and `step` |
+| `/api/v1/series` | Series discovery with `match[]` selectors |
+| `/api/v1/labels` | Label name discovery |
+| `/api/v1/label/<name>/values` | Label value discovery |
+| `/api/v1/status/buildinfo` | Build information |
+| `/api/v1/status/tsdb` | Local TSDB status |
 | `/api/v1/export` | JSON-lines export |
 
-### Supported PromQL subset
+Grafana can use TSDB as a Prometheus datasource by pointing it at the bound
+base URL, for example `http://localhost:9090`.
 
-- Selectors with `=`, `!=`, `=~`, `!~` matchers, range selectors (`[5m]`), `offset`
-- `rate`, `irate`, `increase`, `delta`, `idelta`, `changes`, `resets`, and `*_over_time` (avg/min/max/sum/count/last/present/stddev/stdvar/quantile)
-- `histogram_quantile`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`, `log2`, `log10`, `sgn`, `clamp`, `clamp_min`, `clamp_max`, `scalar`, `vector`, `time`, `absent`, `sort`, `sort_desc`
-- Aggregations: `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `quantile`, `topk`, `bottomk` with `by`/`without`
-- Binary operators: arithmetic, comparisons (incl. `bool`), `and`/`or`/`unless`, one-to-one vector matching with `on`/`ignoring`
+Because the server can bind any port in the configured range, TSDB also exposes
+a Chrome DevTools Protocol helper:
 
-Not supported (yet): subqueries, `@` modifiers, `group_left`/`group_right`, `label_replace`/`label_join`. Unsupported constructs return a clear `400` error.
+```js
+window.__tsdb?.getInfo();
+// { vault, vaultId, pluginVersion, serverRunning, port, metricsPath, baseUrl }
+```
 
-## Endpoints
+The same helper exposes `getStats()`, `getScrapeStatuses()`, `query(expr)`, and
+`queryRange(expr, startMs, endMs, stepMs)` for local tooling and tests.
 
-### Metrics Endpoint
-- **URL**: `http://localhost:9090/metrics`
-- **Format**: Prometheus text format
+### Scrape Prometheus endpoints
 
-### Health Check
-- **URL**: `http://localhost:9090/health`
-- **Response**: `{ "status": "ok", "timestamp": "...", "metrics_endpoint": "/metrics" }`
+Add scrape jobs in settings with one or more target URLs, such as:
+
+```text
+http://localhost:9100/metrics
+```
+
+Each target is scraped into the local database. TSDB adds Prometheus-style
+`job` and `instance` labels, preserves colliding target labels as
+`exported_job` and `exported_instance`, and records synthetic scrape health
+series:
+
+- `up`
+- `scrape_duration_seconds`
+- `scrape_samples_scraped`
+
+External scraping is useful when you want Obsidian to keep a local history of a
+nearby app, development service, or machine exporter without running a separate
+Prometheus instance.
 
 ## Project Structure
 
-```
+```text
 tsdb/
-├── src/
-│   ├── main.ts              # Plugin lifecycle
-│   ├── settings.ts          # Settings model + defaults
-│   ├── labels.ts            # Label sets & matchers (shared)
-│   ├── types.ts             # Public metric API types
-│   ├── exporter/            # prom-client registry, public API, built-in metrics
-│   ├── scrape/              # Exposition parser + scrape scheduler
-│   ├── storage/             # SQLite (sql.js) time-series store
-│   ├── promql/              # PromQL subset: AST, parser, engine
-│   ├── api/                 # HTTP server + /api/v1 routes
-│   └── ui/                  # Modal + settings tab
-├── tests/                   # Vitest suites (parser, engine, store)
-├── obsidian-metrics.d.ts    # Public type declarations (copy to your plugin)
-├── manifest.json            # Plugin manifest
-└── package.json             # Dependencies
++-- src/
+|   +-- main.ts              # Plugin lifecycle and wiring
+|   +-- settings.ts          # Settings model and defaults
+|   +-- labels.ts            # Label sets and matchers
+|   +-- types.ts             # Public metric API types
+|   +-- exporter/            # prom-client registry, public API, built-ins
+|   +-- scrape/              # Exposition parser and scrape scheduler
+|   +-- storage/             # wa-sqlite TSDB, chunked VFS, recovery WAL
+|   +-- promql/              # PromQL AST, parser, and engine
+|   +-- panels/              # Markdown panel config and rendering data
+|   +-- api/                 # HTTP server and /api/v1 routes
+|   +-- ui/                  # Settings, modal, and dashboard view
++-- tests/                   # Vitest suites
++-- obsidian-metrics.d.ts    # Public type declarations
++-- manifest.json            # Plugin manifest
++-- package.json             # npm scripts and dependencies
 ```
 
 ## Development
 
 ```bash
-npm install      # Install dependencies
-npm run build    # Production build (typecheck + bundle)
-npm run dev      # Development with watch mode
-npm test         # Run the vitest suites
+npm install
+npm run build
+npm run dev
+npm test
 ```
+
+Release checks:
+
+```bash
+npm run release
+```
+
+`main.js` is a generated release artifact and is ignored by git. Build it before
+manual installation or release packaging.
 
 ## License
 
