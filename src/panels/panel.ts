@@ -113,6 +113,17 @@ export class PromQLPanel extends MarkdownRenderChild {
 		});
 	}
 
+	private renderUnavailable(message: string): void {
+		if (this.unloaded || !this.bodyEl) return;
+		this.plot?.destroy();
+		this.plot = null;
+		this.bodyEl.empty();
+		this.bodyEl.createDiv({
+			cls: "omx-panel-empty",
+			text: message,
+		});
+	}
+
 	private async refresh(): Promise<void> {
 		const config = this.config;
 		const body = this.bodyEl;
@@ -120,7 +131,8 @@ export class PromQLPanel extends MarkdownRenderChild {
 
 		const engine = this.host.engine;
 		if (!engine) {
-			this.renderError("metrics store is not running");
+			if (this.host.isUnloading) return;
+			this.renderUnavailable("metrics database is starting");
 			return;
 		}
 
@@ -131,7 +143,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 				await this.renderInstant(engine, config, body);
 			}
 		} catch (error) {
-			if (this.unloaded) return;
+			if (this.unloaded || this.host.isUnloading) return;
 			body.empty();
 			body.createDiv({
 				cls: "omx-panel-error",

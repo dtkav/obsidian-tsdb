@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { MarkdownView, Notice, Plugin } from "obsidian";
 // esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
 import waSqliteWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
 import { installMetricsGlobal } from "./api/debug-global";
@@ -46,6 +46,8 @@ const LEGACY_DB_FILENAME = "metrics.db";
 const TSDB_DIRNAME = "metrics-tsdb";
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
+const PROMQL_BLOCK_RE = /```[ \t]*promql[^\r\n]*(?:\r?\n)([\s\S]*?)(?:\r?\n)```/gi;
+const STALE_PROMQL_PANEL_TEXT = "promql panel: metrics store is not running";
 
 export default class ObsidianMetricsPlugin extends Plugin {
 	settings: ObsidianMetricsSettings = DEFAULT_SETTINGS;
@@ -238,6 +240,19 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				new PromQLPanel(el, this, source, ctx.sourcePath, ctx.frontmatter)
 			);
 		});
+		this.refreshMarkdownPreviews();
+		this.app.workspace.onLayoutReady(() => this.scheduleMarkdownPanelRefresh());
+		this.scheduleMarkdownPanelRefresh();
+		this.registerEvent(
+			this.app.workspace.on("layout-change", () => {
+				void this.repairStalePromqlPanels();
+			})
+		);
+		this.registerEvent(
+			this.app.workspace.on("file-open", () => {
+				void this.repairStalePromqlPanels();
+			})
+		);
 
 		// CDP-discoverable surface (window.__tsdb): lets external
 		// tooling attached over the DevTools protocol find the bound port.
@@ -257,9 +272,93 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	}
 
 	onunload() {
+		this.isUnloading = true;
 		// onunload must return void (Obsidian does not await it); run the
 		// async teardown as a detached task.
 		void this.teardown();
+	}
+
+	private refreshMarkdownPreviews(): void {
+		if (this.isUnloading) return;
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view;
+			if (!(view instanceof MarkdownView)) continue;
+			try {
+				view.previewMode.rerender(true);
+			} catch (error) {
+				console.warn("tsdb: could not refresh markdown preview", error);
+			}
+		}
+		void this.repairStalePromqlPanels();
+	}
+
+	private scheduleMarkdownPanelRefresh(): void {
+		if (this.markdownRefreshScheduled) return;
+		this.markdownRefreshScheduled = true;
+		for (const delayMs of [100, 500, 1500, 3000]) {
+			const timeout = window.setTimeout(() => {
+				this.refreshMarkdownPreviews();
+			}, delayMs);
+			this.register(() => window.clearTimeout(timeout));
+		}
+		const repairInterval = window.setInterval(() => {
+			void this.repairStalePromqlPanels();
+		}, 500);
+		const stopRepair = window.setTimeout(() => {
+			window.clearInterval(repairInterval);
+			this.markdownRefreshScheduled = false;
+		}, 12_000);
+		this.register(() => {
+			window.clearInterval(repairInterval);
+			window.clearTimeout(stopRepair);
+			this.markdownRefreshScheduled = false;
+		});
+	}
+
+	private async repairStalePromqlPanels(): Promise<void> {
+		if (this.isUnloading || !this.engine) return;
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view;
+			if (!(view instanceof MarkdownView) || !view.file) continue;
+
+			const panels = Array.from(
+				view.containerEl.querySelectorAll<HTMLElement>(
+					".markdown-reading-view .el-pre > .block-language-promql.omx-panel"
+				)
+			);
+			if (
+				!panels.some((panel) =>
+					panel.textContent?.includes(STALE_PROMQL_PANEL_TEXT)
+				)
+			) {
+				continue;
+			}
+
+			let blocks: string[];
+			try {
+				const markdown = await this.app.vault.cachedRead(view.file);
+				blocks = extractPromqlBlocks(markdown);
+			} catch (error) {
+				console.warn("tsdb: could not read markdown for panel repair", error);
+				continue;
+			}
+
+			const frontmatter =
+				this.app.metadataCache.getFileCache(view.file)?.frontmatter;
+			for (let index = 0; index < panels.length; index++) {
+				const panel = panels[index];
+				if (!panel.textContent?.includes(STALE_PROMQL_PANEL_TEXT)) continue;
+				const source = blocks[index];
+				const parent = panel.parentElement;
+				if (!source || !parent) continue;
+
+				parent.empty();
+				const container = parent.createDiv({ cls: "block-language-promql" });
+				this.addChild(
+					new PromQLPanel(container, this, source, view.file.path, frontmatter)
+				);
+			}
+		}
 	}
 
 	private async teardown(): Promise<void> {
@@ -506,4 +605,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+}
+
+function extractPromqlBlocks(markdown: string): string[] {
+	const blocks: string[] = [];
+	PROMQL_BLOCK_RE.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = PROMQL_BLOCK_RE.exec(markdown)) !== null) {
+		blocks.push(match[1]);
+	}
+	return blocks;
 }
