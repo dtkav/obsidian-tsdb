@@ -15,6 +15,377 @@
 	gap: 10px;
 }
 
+/* Global dashboard time selector */
+
+.tsdb-time-status {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	align-self: center;
+	flex: 0 1 auto;
+	height: 28px;
+	max-width: min(34vw, 360px);
+	min-width: 0;
+	padding: 0 10px 0 12px;
+	margin: 0 10px 0 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 999px;
+	cursor: pointer;
+	color: var(--text-normal);
+	background-color: var(--background-secondary);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+	-webkit-app-region: no-drag;
+	user-select: none;
+}
+
+.tsdb-time-status *,
+.omx-time-popover,
+.omx-time-popover * {
+	-webkit-app-region: no-drag;
+}
+
+.tsdb-time-status:hover,
+.tsdb-time-status:focus-visible,
+.tsdb-time-status.is-active {
+	border-color: var(--background-modifier-border-hover);
+	background-color: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.tsdb-time-status:focus-visible {
+	outline: 2px solid var(--background-modifier-border-focus);
+	outline-offset: 2px;
+}
+
+.tsdb-time-status-label {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.tsdb-time-status-logo {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 auto;
+	width: 15px;
+	height: 15px;
+	color: var(--text-accent);
+}
+
+.tsdb-time-status-logo svg {
+	width: 15px;
+	height: 15px;
+	stroke-width: 2.25;
+}
+
+.tsdb-time-status-note {
+	flex: 0 0 auto;
+	color: var(--text-accent);
+	font-size: 11px;
+}
+
+.tsdb-time-status-caret {
+	flex: 0 0 auto;
+	width: 6px;
+	height: 6px;
+	margin-left: 1px;
+	border-right: 1.5px solid currentColor;
+	border-bottom: 1.5px solid currentColor;
+	opacity: 0.72;
+	transform: translateY(-2px) rotate(45deg);
+}
+
+.omx-time-popover {
+	position: fixed;
+	z-index: var(--layer-popover, 1000);
+	width: min(620px, calc(100vw - 16px));
+	max-height: calc(100vh - 16px);
+	overflow: auto;
+	color: var(--text-normal);
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	box-shadow: var(--shadow-l);
+	font-size: 13px;
+}
+
+.omx-time-popover button {
+	appearance: none;
+	box-sizing: border-box;
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: none;
+	box-shadow: none;
+	color: inherit;
+	cursor: pointer;
+	font: inherit;
+	line-height: 1;
+	text-align: inherit;
+	text-shadow: none;
+}
+
+.omx-time-popover button:focus-visible {
+	outline: 2px solid var(--background-modifier-border-focus);
+	outline-offset: 2px;
+}
+
+.omx-time-popover-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 12px 14px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.omx-time-title-group {
+	min-width: 0;
+}
+
+.omx-time-title {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.omx-time-summary {
+	margin-top: 2px;
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.omx-time-header-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 6px;
+	flex: 0 0 auto;
+	max-width: 280px;
+}
+
+.omx-time-popover button.omx-time-action,
+.omx-time-popover button.omx-time-primary-action,
+.omx-time-custom button,
+.omx-time-preset-list button {
+	border-radius: 6px;
+}
+
+.omx-time-popover button.omx-time-action {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	height: 28px;
+	padding: 0 9px;
+	border: 1px solid var(--background-modifier-border);
+	color: var(--text-muted);
+	background-color: var(--background-secondary);
+	font-size: 12px;
+}
+
+.omx-time-popover button.omx-time-action:hover {
+	border-color: var(--background-modifier-border-hover);
+	color: var(--text-normal);
+	background-color: var(--background-modifier-hover);
+}
+
+.omx-time-popover-body {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(220px, 0.85fr);
+	gap: 0;
+}
+
+.omx-time-column {
+	min-width: 0;
+	padding: 12px 14px 14px;
+}
+
+.omx-time-column + .omx-time-column {
+	border-left: 1px solid var(--background-modifier-border);
+}
+
+.omx-time-section-title {
+	margin-bottom: 9px;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text-muted);
+}
+
+.omx-time-custom {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 8px;
+	margin-bottom: 10px;
+}
+
+.omx-time-custom button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	height: 30px;
+	padding: 0 11px;
+	border: 1px solid var(--interactive-accent);
+	color: var(--text-on-accent);
+	background-color: var(--interactive-accent);
+	font-size: 12px;
+	font-weight: 500;
+}
+
+.omx-time-custom button:hover {
+	background-color: var(--interactive-accent-hover);
+	border-color: var(--interactive-accent-hover);
+}
+
+.omx-time-custom input,
+.omx-time-field input,
+.omx-time-step select {
+	width: 100%;
+	height: 30px;
+	font-size: 13px;
+}
+
+.omx-time-preset-list {
+	display: grid;
+	grid-template-columns: 1fr;
+	gap: 2px;
+	max-height: 238px;
+	overflow: auto;
+	padding-right: 2px;
+}
+
+.omx-time-preset-list button {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	width: 100%;
+	height: 30px;
+	padding: 0 8px;
+	color: var(--text-muted);
+	text-align: left;
+}
+
+.omx-time-preset-list button:hover,
+.omx-time-preset-list button.is-selected {
+	color: var(--text-normal);
+	background-color: var(--background-modifier-hover);
+}
+
+.omx-time-preset-list button.is-selected {
+	box-shadow: inset 2px 0 0 var(--interactive-accent);
+}
+
+.omx-time-preset-short {
+	flex: 0 0 auto;
+	color: var(--text-faint);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+}
+
+.omx-time-field {
+	display: grid;
+	gap: 5px;
+	margin-bottom: 10px;
+}
+
+.omx-time-field-label {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.omx-time-popover button.omx-time-primary-action {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	height: 32px;
+	margin-top: 2px;
+	border: 1px solid var(--background-modifier-border);
+	color: var(--text-normal);
+	background-color: var(--background-secondary);
+	font-size: 12px;
+	font-weight: 500;
+	text-align: center;
+}
+
+.omx-time-popover button.omx-time-primary-action:hover {
+	border-color: var(--background-modifier-border-hover);
+	background-color: var(--background-modifier-hover);
+}
+
+.omx-time-popover-footer {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 10px 14px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.omx-time-step {
+	display: grid;
+	grid-template-columns: auto minmax(100px, 140px);
+	align-items: center;
+	gap: 8px;
+}
+
+.omx-time-step select {
+	height: 28px;
+}
+
+.omx-time-note-override {
+	min-width: 0;
+	color: var(--text-muted);
+	font-size: 12px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.omx-time-error {
+	color: var(--text-error);
+	font-size: 12px;
+	margin-left: auto;
+}
+
+@media (max-width: 640px) {
+	.tsdb-time-status {
+		max-width: 48vw;
+		padding: 0 8px;
+	}
+
+	.tsdb-time-status-note {
+		display: none;
+	}
+
+	.omx-time-popover-header,
+	.omx-time-popover-footer {
+		display: grid;
+	}
+
+	.omx-time-header-actions {
+		justify-content: flex-start;
+		max-width: none;
+	}
+
+	.omx-time-popover-body {
+		grid-template-columns: 1fr;
+	}
+
+	.omx-time-column + .omx-time-column {
+		border-top: 1px solid var(--background-modifier-border);
+		border-left: 0;
+	}
+}
+
 /* Settings: status header card */
 
 .omx-settings-status {

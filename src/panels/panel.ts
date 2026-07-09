@@ -1,13 +1,16 @@
 import { MarkdownRenderChild, parseYaml } from "obsidian";
 import uPlot from "uplot";
 import { ApiResultData, PromQLEngine } from "../promql/engine";
-import { PanelConfig, parsePanelConfig, resolveStepMs } from "./config";
+import { PanelConfig, parsePanelConfig } from "./config";
 import {
 	alignMatrix,
 	buildPanelLegends,
 	formatLegend,
 	formatUnitValue,
 } from "./data";
+import { TimeContext } from "../time/context";
+import { parseTimeOverrides } from "../time/frontmatter";
+import { expandTimeMacros } from "../time/query-vars";
 
 // Validated categorical palettes (CVD-safe slot ordering; the dark column is
 // the same hues re-stepped for dark surfaces, not a separate palette).
@@ -28,6 +31,8 @@ function activePalette(): string[] {
 
 export interface PanelHost {
 	engine: PromQLEngine | null;
+	timeContext: TimeContext;
+	isUnloading?: boolean;
 }
 
 /**
@@ -39,16 +44,26 @@ export interface PanelHost {
 export class PromQLPanel extends MarkdownRenderChild {
 	private host: PanelHost;
 	private source: string;
+	private sourcePath: string;
+	private frontmatter: unknown;
 	private config: PanelConfig | null = null;
 	private plot: uPlot | null = null;
 	private resizeObserver: ResizeObserver | null = null;
 	private bodyEl: HTMLElement | null = null;
 	private unloaded = false;
 
-	constructor(containerEl: HTMLElement, host: PanelHost, source: string) {
+	constructor(
+		containerEl: HTMLElement,
+		host: PanelHost,
+		source: string,
+		sourcePath: string,
+		frontmatter: unknown
+	) {
 		super(containerEl);
 		this.host = host;
 		this.source = source;
+		this.sourcePath = sourcePath;
+		this.frontmatter = frontmatter;
 	}
 
 	onload(): void {
@@ -70,6 +85,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		this.bodyEl = this.containerEl.createDiv({ cls: "omx-panel-body" });
 
 		void this.refresh();
+		this.register(this.host.timeContext.subscribe(() => void this.refresh()));
 		if (this.config.refreshSeconds !== null) {
 			this.registerInterval(
 				window.setInterval(
@@ -131,10 +147,10 @@ export class PromQLPanel extends MarkdownRenderChild {
 		config: PanelConfig,
 		body: HTMLElement
 	): Promise<void> {
-		const endMs = Date.now();
-		const stepMs = resolveStepMs(config);
-		const startMs =
-			Math.floor((endMs - config.rangeMs) / stepMs) * stepMs;
+		const resolved = this.host.timeContext.resolve(
+			config,
+			parseTimeOverrides(this.frontmatter)
+		);
 
 		const aligned: {
 			metric: Record<string, string>;
@@ -143,13 +159,19 @@ export class PromQLPanel extends MarkdownRenderChild {
 		}[] = [];
 		let xs: number[] | null = null;
 		for (const query of config.queries) {
-			const result = await engine.rangeQuery(query.expr, startMs, endMs, stepMs);
+			const expr = expandTimeMacros(query.expr, resolved);
+			const result = await engine.rangeQuery(
+				expr,
+				resolved.startMs,
+				resolved.endMs,
+				resolved.stepMs
+			);
 			if (this.unloaded) return;
 			const data = alignMatrix(
 				result,
-				startMs / 1000,
-				endMs / 1000,
-				stepMs / 1000,
+				resolved.startMs / 1000,
+				resolved.endMs / 1000,
+				resolved.stepMs / 1000,
 				query.legend
 			);
 			xs = data.xs;
@@ -243,9 +265,14 @@ export class PromQLPanel extends MarkdownRenderChild {
 		config: PanelConfig,
 		body: HTMLElement
 	): Promise<void> {
-		const nowMs = Date.now();
+		const resolved = this.host.timeContext.resolve(
+			config,
+			parseTimeOverrides(this.frontmatter)
+		);
 		const results: ApiResultData[] = await Promise.all(
-			config.queries.map((q) => engine.instantQuery(q.expr, nowMs))
+			config.queries.map((q) =>
+				engine.instantQuery(expandTimeMacros(q.expr, resolved), resolved.endMs)
+			)
 		);
 		if (this.unloaded) return;
 		body.empty();

@@ -25,6 +25,8 @@ import { PromQLPanel } from "./panels/panel";
 import { migrateLegacySnapshot } from "./storage/chunk-vfs";
 import { MetricsStore, StoreStats, StoredSample } from "./storage/store";
 import { SampleWal } from "./storage/wal";
+import { TimeContext } from "./time/context";
+import { TimeSelectorController } from "./time/selector";
 import {
 	METRICS_DASHBOARD_VIEW_TYPE,
 	MetricsDashboardView,
@@ -58,6 +60,10 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private statusBarEl: HTMLElement | null = null;
 	private flushTimer: number | null = null;
 	private retentionTimer: number | null = null;
+	private markdownRefreshScheduled = false;
+	public isUnloading = false;
+
+	public timeContext: TimeContext = new TimeContext();
 
 	/**
 	 * Public API for other plugins: api.getStore(name, { intervalSeconds })
@@ -67,6 +73,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	public api: IObsidianMetricsRootAPI;
 
 	async onload() {
+		this.isUnloading = false;
 		await this.loadSettings();
 
 		// Exporter side: metric stores (named registries, each recorded at
@@ -218,6 +225,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new MetricsSettingTab(this.app, this));
+		new TimeSelectorController(this, this.timeContext);
 
 		this.registerView(
 			METRICS_DASHBOARD_VIEW_TYPE,
@@ -226,7 +234,9 @@ export default class ObsidianMetricsPlugin extends Plugin {
 
 		// ```promql code blocks render as live panels in notes and plugin views.
 		this.registerMarkdownCodeBlockProcessor("promql", (source, el, ctx) => {
-			ctx.addChild(new PromQLPanel(el, this, source));
+			ctx.addChild(
+				new PromQLPanel(el, this, source, ctx.sourcePath, ctx.frontmatter)
+			);
 		});
 
 		// CDP-discoverable surface (window.__tsdb): lets external
