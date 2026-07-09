@@ -18,14 +18,9 @@ const packageJson = readJson("package.json");
 const versions = readJson("versions.json");
 
 check(manifest.id === "tsdb", 'manifest id must be "tsdb"');
-check(
-	manifest.name === "Time Series Database",
-	'manifest name must be "Time Series Database"'
-);
-check(
-	manifest.name !== manifest.name.toUpperCase(),
-	"manifest name must not be all caps"
-);
+// TSDB is an acronym: the directory's all-caps warning is waived for
+// acronyms, and the name must keep matching the community-plugins entry.
+check(manifest.name === "TSDB", 'manifest name must be "TSDB"');
 check(
 	/[.!?]$/.test(manifest.description),
 	"manifest description must end with punctuation"

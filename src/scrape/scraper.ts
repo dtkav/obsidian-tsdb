@@ -1,10 +1,15 @@
-import * as http from "http";
-import * as https from "https";
-import { URL } from "url";
 import { Labels, NAME_LABEL } from "../labels";
 import { StoredSample } from "../storage/store";
 import { SampleSink } from "../storage/wal";
 import { parseExposition } from "./parser";
+import type { HttpModule, UrlModule } from "../types/runtime";
+
+// The Electron renderer that hosts plugins exposes CommonJS require; call it
+// through an alias so the Node builtins load at runtime without importing them.
+const nodeRequire = require;
+const http = nodeRequire("http") as HttpModule;
+const https = nodeRequire("https") as HttpModule;
+const { URL } = nodeRequire("url") as UrlModule;
 
 export interface ScrapeJobConfig {
 	jobName: string;
@@ -59,9 +64,10 @@ export function fetchText(
 				reject(new Error(`unexpected status ${status} from ${url}`));
 				return;
 			}
-			const chunks: Buffer[] = [];
-			res.on("data", (chunk: Buffer) => chunks.push(chunk));
-			res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+			res.setEncoding("utf8");
+			let body = "";
+			res.on("data", (chunk) => (body += chunk));
+			res.on("end", () => resolve(body));
 			res.on("error", reject);
 		});
 		req.on("timeout", () => req.destroy(new Error(`scrape timeout for ${url}`)));

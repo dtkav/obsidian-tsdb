@@ -20,6 +20,7 @@ import {
 	mergeSettings,
 } from "./settings";
 import { IObsidianMetricsRootAPI } from "./types";
+import type { ErrnoError } from "./types/runtime";
 import { PromQLPanel } from "./panels/panel";
 import { migrateLegacySnapshot } from "./storage/chunk-vfs";
 import { MetricsStore, StoreStats, StoredSample } from "./storage/store";
@@ -298,7 +299,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			console.warn("Metrics server failed to start:", error);
 			const range = end > start ? `ports ${start}-${end}` : `port ${start}`;
 			let message = `Metrics server disabled - ${range} not available`;
-			const code = (error as NodeJS.ErrnoException | undefined)?.code;
+			const code = (error as ErrnoError | undefined)?.code;
 			if (code === "EADDRINUSE") {
 				message += ". Other services are using these ports.";
 			} else if (code === "EACCES") {

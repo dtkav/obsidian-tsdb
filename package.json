@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"check": "tsc -noEmit -skipLibCheck",
+		"check:no-node": "tsc -noEmit -skipLibCheck -p tsconfig.no-node.json",
 		"build": "npm run check && node esbuild.config.mjs production",
 		"verify-release": "node scripts/verify-release.mjs",
 		"release": "npm run build && npm run test --if-present && npm run verify-release",

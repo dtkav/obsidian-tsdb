@@ -1,4 +1,9 @@
-import * as client from 'prom-client';
+import type { Metric } from 'prom-client';
+import Registry from 'prom-client/lib/registry';
+import Counter from 'prom-client/lib/counter';
+import Gauge from 'prom-client/lib/gauge';
+import Histogram from 'prom-client/lib/histogram';
+import Summary from 'prom-client/lib/summary';
 import {
 	CounterOptions,
 	GaugeOptions,
@@ -11,12 +16,12 @@ import {
 } from '../types';
 
 export class MetricsManager implements MetricsRegistry {
-	private registry: client.Registry;
-	private metrics: Map<string, client.Metric<string>>;
+	private registry: Registry;
+	private metrics: Map<string, Metric<string>>;
 	private prefix: string;
 
 	constructor(prefix: string = 'obsidian_') {
-		this.registry = new client.Registry();
+		this.registry = new Registry();
 		this.metrics = new Map();
 		this.prefix = prefix;
 		
@@ -31,7 +36,7 @@ export class MetricsManager implements MetricsRegistry {
 			return this.getMetric(name)!;
 		}
 
-		const counter = new client.Counter({
+		const counter = new Counter({
 			name,
 			help: options.help,
 			labelNames: options.labelNames || options.labels || [],
@@ -73,7 +78,7 @@ export class MetricsManager implements MetricsRegistry {
 			return this.getMetric(name)!;
 		}
 
-		const gauge = new client.Gauge({
+		const gauge = new Gauge({
 			name,
 			help: options.help,
 			labelNames: options.labelNames || options.labels || [],
@@ -127,7 +132,7 @@ export class MetricsManager implements MetricsRegistry {
 			return this.getMetric(name)!;
 		}
 
-		const histogram = new client.Histogram({
+		const histogram = new Histogram({
 			name,
 			help: options.help,
 			labelNames: options.labelNames || options.labels || [],
@@ -176,7 +181,7 @@ export class MetricsManager implements MetricsRegistry {
 			return this.getMetric(name)!;
 		}
 
-		const summary = new client.Summary({
+		const summary = new Summary({
 			name,
 			help: options.help,
 			labelNames: options.labelNames || options.labels || [],
@@ -228,7 +233,7 @@ export class MetricsManager implements MetricsRegistry {
 		}
 
 		// Return a wrapper that provides the MetricInstance interface
-		if (metric instanceof client.Counter) {
+		if (metric instanceof Counter) {
 			const counter = metric;
 			return {
 				inc: (value?: number, labels?: MetricLabels) => {
@@ -255,7 +260,7 @@ export class MetricsManager implements MetricsRegistry {
 			};
 		}
 
-		if (metric instanceof client.Gauge) {
+		if (metric instanceof Gauge) {
 			const gauge = metric;
 			return {
 				inc: (value?: number, labels?: MetricLabels) => {
@@ -294,7 +299,7 @@ export class MetricsManager implements MetricsRegistry {
 			};
 		}
 
-		if (metric instanceof client.Histogram) {
+		if (metric instanceof Histogram) {
 			const histogram = metric;
 			return {
 				inc: () => { throw new Error('Histogram does not support inc'); },
@@ -327,7 +332,7 @@ export class MetricsManager implements MetricsRegistry {
 			};
 		}
 
-		if (metric instanceof client.Summary) {
+		if (metric instanceof Summary) {
 			const summary = metric;
 			return {
 				inc: () => { throw new Error('Summary does not support inc'); },
@@ -387,7 +392,7 @@ export class MetricsManager implements MetricsRegistry {
 		// Don't re-register Node.js default metrics - keep only Obsidian metrics
 	}
 
-	getRegistry(): client.Registry {
+	getRegistry(): Registry {
 		return this.registry;
 	}
 

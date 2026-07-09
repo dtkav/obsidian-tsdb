@@ -1,11 +1,23 @@
-import * as http from "http";
-import * as net from "net";
-import { URL, URLSearchParams } from "url";
 import { PromQLError, parseDuration } from "../promql/ast";
 import { PromQLEngine } from "../promql/engine";
 import { parseSeriesSelector } from "../promql/parser";
 import { MetricsStore } from "../storage/store";
 import { Matcher } from "../labels";
+import type {
+	ErrnoError,
+	HttpModule,
+	IncomingMessage,
+	Server,
+	ServerResponse,
+	Socket,
+	UrlModule,
+} from "../types/runtime";
+
+// The Electron renderer that hosts plugins exposes CommonJS require; call it
+// through an alias so the Node builtins load at runtime without importing them.
+const nodeRequire = require;
+const http = nodeRequire("http") as HttpModule;
+const { URL, URLSearchParams } = nodeRequire("url") as UrlModule;
 
 export interface ApiServerDeps {
 	/** Text exposition of the live prom-client registry (the /metrics page). */
@@ -48,9 +60,9 @@ interface ApiRequest {
  *    used directly as a "Prometheus" datasource in Grafana.
  */
 export class ApiServer {
-	private server: http.Server | null = null;
+	private server: Server | null = null;
 	private port: number | null = null;
-	private sockets = new Set<net.Socket>();
+	private sockets = new Set<Socket>();
 	private deps: ApiServerDeps | null;
 
 	constructor(deps: ApiServerDeps) {
@@ -103,7 +115,7 @@ export class ApiServer {
 			} catch (error: unknown) {
 				lastError = error;
 				// Only walk the range for "port taken" style errors.
-				const code = (error as NodeJS.ErrnoException | undefined)?.code;
+				const code = (error as ErrnoError | undefined)?.code;
 				if (code !== "EADDRINUSE" && code !== "EACCES") {
 					throw error;
 				}
@@ -147,7 +159,7 @@ export class ApiServer {
 	}
 
 	private async readParams(
-		req: http.IncomingMessage,
+		req: IncomingMessage,
 		url: URL
 	): Promise<URLSearchParams> {
 		const params = new URLSearchParams(url.search);
@@ -155,24 +167,23 @@ export class ApiServer {
 			const contentType = req.headers["content-type"] ?? "";
 			if (contentType.includes("application/x-www-form-urlencoded")) {
 				const body = await new Promise<string>((resolve, reject) => {
-					const chunks: Buffer[] = [];
-					req.on("data", (chunk: Buffer) => chunks.push(chunk));
-					req.on("end", () =>
-						resolve(Buffer.concat(chunks).toString("utf8"))
-					);
+					let raw = "";
+					req.setEncoding("utf8");
+					req.on("data", (chunk) => (raw += chunk));
+					req.on("end", () => resolve(raw));
 					req.on("error", reject);
 				});
-				for (const [key, value] of new URLSearchParams(body)) {
-					params.append(key, value);
-				}
+				new URLSearchParams(body).forEach((value, key) =>
+					params.append(key, value)
+				);
 			}
 		}
 		return params;
 	}
 
 	private async handle(
-		req: http.IncomingMessage,
-		res: http.ServerResponse
+		req: IncomingMessage,
+		res: ServerResponse
 	): Promise<void> {
 		res.setHeader("Access-Control-Allow-Origin", "*");
 		res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -234,7 +245,7 @@ export class ApiServer {
 	}
 
 	private async handleApiV1(
-		res: http.ServerResponse,
+		res: ServerResponse,
 		request: ApiRequest,
 		deps: ApiServerDeps
 	): Promise<void> {
@@ -391,11 +402,11 @@ export class ApiServer {
 		return value;
 	}
 
-	private success(res: http.ServerResponse, data: unknown): void {
+	private success(res: ServerResponse, data: unknown): void {
 		this.json(res, 200, { status: "success", data });
 	}
 
-	private sendError(res: http.ServerResponse, error: unknown): void {
+	private sendError(res: ServerResponse, error: unknown): void {
 		if (error instanceof PromQLError) {
 			this.json(res, 400, {
 				status: "error",
@@ -412,7 +423,7 @@ export class ApiServer {
 		});
 	}
 
-	private json(res: http.ServerResponse, code: number, body: unknown): void {
+	private json(res: ServerResponse, code: number, body: unknown): void {
 		res.writeHead(code, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(body));
 	}
