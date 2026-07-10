@@ -25,3 +25,16 @@ export function parseTimeOverrides(frontmatter: unknown): TimeOverrides | null {
 	if (stepMs !== undefined) overrides.stepMs = stepMs;
 	return Object.keys(overrides).length > 0 ? overrides : null;
 }
+
+export function parseMarkdownFrontmatter(
+	markdown: string,
+	parseYaml: (yaml: string) => unknown
+): unknown {
+	const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
+	if (!match) return null;
+	try {
+		return parseYaml(match[1]) ?? null;
+	} catch {
+		return null;
+	}
+}

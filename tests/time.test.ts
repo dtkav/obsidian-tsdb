@@ -4,7 +4,10 @@ import {
 	durationLabel,
 	resolveTimeRange,
 } from "../src/time/context";
-import { parseTimeOverrides } from "../src/time/frontmatter";
+import {
+	parseMarkdownFrontmatter,
+	parseTimeOverrides,
+} from "../src/time/frontmatter";
 import { expandTimeMacros } from "../src/time/query-vars";
 import { PanelConfig } from "../src/panels/config";
 
@@ -78,6 +81,35 @@ describe("global time context resolution", () => {
 });
 
 describe("time frontmatter", () => {
+	it("parses YAML frontmatter from markdown text", () => {
+		const frontmatter = parseMarkdownFrontmatter(
+			[
+				"---",
+				"tsdb:",
+				"  start: 2026-07-08T09:00:00-07:00",
+				"  end: 2026-07-08T12:00:00-07:00",
+				"  step: 30s",
+				"---",
+				"",
+				"```promql",
+				"up",
+				"```",
+			].join("\n"),
+			(yaml) => ({
+				tsdb: Object.fromEntries(
+					yaml
+						.split("\n")
+						.slice(1)
+						.map((line) => line.trim().split(/:\s+/, 2))
+				),
+			})
+		);
+		const overrides = parseTimeOverrides(frontmatter);
+		expect(overrides?.startMs).toBe(Date.parse("2026-07-08T09:00:00-07:00"));
+		expect(overrides?.endMs).toBe(Date.parse("2026-07-08T12:00:00-07:00"));
+		expect(overrides?.stepMs).toBe(30_000);
+	});
+
 	it("parses direct tsdb start/end/step overrides", () => {
 		const overrides = parseTimeOverrides({
 			tsdb: {

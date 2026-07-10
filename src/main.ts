@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, parseYaml } from "obsidian";
 // esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
 import waSqliteAsyncWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
 import waSqliteSyncWasm from "wa-sqlite/dist/wa-sqlite.wasm";
@@ -45,6 +45,7 @@ import { maintainStartupWal } from "./storage/wal-maintenance";
 import { WorkerMetricsStore } from "./storage/worker-store";
 import { createInlineWorkerStoreTransport } from "./storage/worker-transport";
 import { TimeContext } from "./time/context";
+import { parseMarkdownFrontmatter } from "./time/frontmatter";
 import { TimeSelectorController } from "./time/selector";
 import {
 	METRICS_DASHBOARD_VIEW_TYPE,
@@ -1108,6 +1109,17 @@ export default class ObsidianMetricsPlugin extends Plugin {
 
 	getFrontmatter(sourcePath: string): unknown {
 		return this.app.metadataCache.getCache(sourcePath)?.frontmatter;
+	}
+
+	async loadFrontmatter(sourcePath: string): Promise<unknown> {
+		const cachedFrontmatter =
+			this.app.metadataCache.getCache(sourcePath)?.frontmatter;
+		if (cachedFrontmatter !== undefined) return cachedFrontmatter;
+
+		const file = this.app.vault.getAbstractFileByPath(sourcePath);
+		if (!(file instanceof TFile)) return null;
+		const markdown = await this.app.vault.cachedRead(file);
+		return parseMarkdownFrontmatter(markdown, parseYaml);
 	}
 
 	onFrontmatterChanged(sourcePath: string, listener: () => void): () => void {

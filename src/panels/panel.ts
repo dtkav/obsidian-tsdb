@@ -43,6 +43,7 @@ export interface PanelHost {
 	isUnloading?: boolean;
 	getHealthStatus?: () => ApiHealthStatus;
 	getFrontmatter?: (sourcePath: string) => unknown;
+	loadFrontmatter?: (sourcePath: string) => Promise<unknown>;
 	onFrontmatterChanged?: (
 		sourcePath: string,
 		listener: () => void
@@ -64,6 +65,8 @@ export class PromQLPanel extends MarkdownRenderChild {
 	private plot: uPlot | null = null;
 	private resizeObserver: ResizeObserver | null = null;
 	private bodyEl: HTMLElement | null = null;
+	private loadedFrontmatter: unknown = undefined;
+	private loadFrontmatterPromise: Promise<unknown> | null = null;
 	private unloaded = false;
 
 	constructor(
@@ -200,7 +203,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	): Promise<void> {
 		const resolved = this.host.timeContext.resolve(
 			config,
-			parseTimeOverrides(this.currentFrontmatter())
+			await this.currentTimeOverrides()
 		);
 
 		const aligned: {
@@ -315,7 +318,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	): Promise<void> {
 		const resolved = this.host.timeContext.resolve(
 			config,
-			parseTimeOverrides(this.currentFrontmatter())
+			await this.currentTimeOverrides()
 		);
 		const results: ApiResultData[] = await Promise.all(
 			config.queries.map((q) =>
@@ -400,5 +403,20 @@ export class PromQLPanel extends MarkdownRenderChild {
 			return this.host.getFrontmatter(this.sourcePath);
 		}
 		return this.initialFrontmatter;
+	}
+
+	private async currentTimeOverrides() {
+		let frontmatter = this.currentFrontmatter() ?? this.initialFrontmatter;
+		let overrides = parseTimeOverrides(frontmatter);
+		if (overrides || !this.host.loadFrontmatter) return overrides;
+
+		if (this.loadedFrontmatter === undefined) {
+			this.loadFrontmatterPromise ??= this.host.loadFrontmatter(this.sourcePath);
+			this.loadedFrontmatter = await this.loadFrontmatterPromise;
+		}
+		if (this.unloaded) return null;
+		frontmatter = this.currentFrontmatter() ?? this.loadedFrontmatter;
+		overrides = parseTimeOverrides(frontmatter);
+		return overrides;
 	}
 }
