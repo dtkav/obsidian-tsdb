@@ -209,6 +209,17 @@ export interface ScraperStatus {
 
 export type ScrapeStatusChangeListener = () => void;
 
+export interface ScrapeObservation {
+	source: string;
+	target: string;
+	kind: "self" | "target";
+	status: "ok" | "error";
+	durationSeconds: number;
+	samplesScraped: number;
+}
+
+export type ScrapeObserver = (observation: ScrapeObservation) => void;
+
 /**
  * Schedules scrapes of the plugin's own registry and of external HTTP
  * targets, writing samples into the MetricsStore.
@@ -216,6 +227,7 @@ export type ScrapeStatusChangeListener = () => void;
 export class Scraper {
 	private sink: SampleSink;
 	private onTargetStatusChange: ScrapeStatusChangeListener | null;
+	private observer: ScrapeObserver | null;
 	private timers: number[] = [];
 	private inFlight = new Map<string, number>();
 	private statuses = new Map<string, ScraperStatus>();
@@ -223,10 +235,12 @@ export class Scraper {
 
 	constructor(
 		sink: SampleSink,
-		onTargetStatusChange: ScrapeStatusChangeListener | null = null
+		onTargetStatusChange: ScrapeStatusChangeListener | null = null,
+		observer: ScrapeObserver | null = null
 	) {
 		this.sink = sink;
 		this.onTargetStatusChange = onTargetStatusChange;
+		this.observer = observer;
 	}
 
 	start(
@@ -273,6 +287,7 @@ export class Scraper {
 		this.inFlight.clear();
 		this.statuses.clear();
 		this.sink = { ingest: () => undefined };
+		this.observer = null;
 	}
 
 	getStatuses(): ScraperStatus[] {
@@ -318,11 +333,27 @@ export class Scraper {
 			if (generation !== this.generation) return;
 			await this.sink.ingest(samples);
 			if (generation !== this.generation) return;
+			this.observeScrape({
+				source: source.jobName,
+				target: "self",
+				kind: "self",
+				status: "ok",
+				durationSeconds: duration,
+				samplesScraped: samples.length - 3,
+			});
 			this.setStatus(key, source.jobName, "self", started, null);
 		} catch (error) {
 			if (generation !== this.generation) return;
 			await this.recordFailure(source.jobName, instance, started);
 			if (generation !== this.generation) return;
+			this.observeScrape({
+				source: source.jobName,
+				target: "self",
+				kind: "self",
+				status: "error",
+				durationSeconds: (Date.now() - started) / 1000,
+				samplesScraped: 0,
+			});
 			this.setStatus(key, source.jobName, "self", started, String(error));
 		} finally {
 			if (this.inFlight.get(key) === generation) this.inFlight.delete(key);
@@ -361,10 +392,26 @@ export class Scraper {
 			this.setStatus(key, job.jobName, target, started, null, true);
 			await this.sink.ingest(samples);
 			if (generation !== this.generation) return;
+			this.observeScrape({
+				source: job.jobName,
+				target,
+				kind: "target",
+				status: "ok",
+				durationSeconds: duration,
+				samplesScraped: samples.length - 3,
+			});
 		} catch (error) {
 			if (generation !== this.generation) return;
 			this.setStatus(key, job.jobName, target, started, String(error), true);
 			await this.recordFailure(job.jobName, instance, started);
+			this.observeScrape({
+				source: job.jobName,
+				target,
+				kind: "target",
+				status: "error",
+				durationSeconds: (Date.now() - started) / 1000,
+				samplesScraped: 0,
+			});
 		} finally {
 			if (this.inFlight.get(key) === generation) this.inFlight.delete(key);
 		}
@@ -407,5 +454,13 @@ export class Scraper {
 			up: lastError === null,
 		});
 		if (notify) this.onTargetStatusChange?.();
+	}
+
+	private observeScrape(observation: ScrapeObservation): void {
+		try {
+			this.observer?.(observation);
+		} catch (error) {
+			console.error("tsdb: scrape observer failed", error);
+		}
 	}
 }

@@ -10,8 +10,11 @@ import {
 import {
 	MetricSourceRegistry,
 	PERFORMANCE_SOURCE,
+	TSDB_SOURCE,
 	VAULT_SOURCE,
 } from "./exporter/sources";
+import { setupTsdbMetrics } from "./exporter/tsdb-metrics";
+import type { TsdbMetricsRecorder } from "./exporter/tsdb-metrics";
 import { PromQLEngine } from "./promql/engine";
 import { Scraper, ScraperStatus } from "./scrape/scraper";
 import {
@@ -85,6 +88,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private store: MetricsStore | null = null;
 	private wal: SampleWal | null = null;
 	private scraper: Scraper | null = null;
+	private tsdbMetrics: TsdbMetricsRecorder | null = null;
 	private settingsTab: MetricsSettingTab | null = null;
 	/** Query engine over the local TSDB (used by the API and note panels). */
 	public engine: PromQLEngine | null = null;
@@ -154,6 +158,16 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			description:
 				"Browser memory usage and measured Obsidian API timings.",
 		});
+		this.tsdbMetrics = setupTsdbMetrics(
+			sources.getSource(TSDB_SOURCE, {
+				displayName: "TSDB internals",
+				description:
+					"Scrape collection, SQLite ingest, WAL checkpoint, and queue health.",
+			}).api
+		);
+		this.register(() => {
+			this.tsdbMetrics = null;
+		});
 
 		// TSDB side: SQLite (wa-sqlite over a desktop .sqlite file when
 		// available, else the vault-adapter chunk VFS), WAL, scraper and query
@@ -219,9 +233,21 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			);
 		}
 
-		this.scraper = new Scraper({
-			ingest: (samples: StoredSample[]) => this.ingestDurably(samples),
-		}, () => this.settingsTab?.onScrapeStatusChanged());
+		this.scraper = new Scraper(
+			{
+				ingest: (samples: StoredSample[]) => this.ingestDurably(samples),
+			},
+			() => this.settingsTab?.onScrapeStatusChanged(),
+			(observation) => {
+				this.tsdbMetrics?.recordScrape({
+					source: observation.source,
+					kind: observation.kind,
+					status: observation.status,
+					durationSeconds: observation.durationSeconds,
+					samplesScraped: observation.samplesScraped,
+				});
+			}
+		);
 
 		this.engine = new PromQLEngine(this.store);
 		this.apiServer = new ApiServer({
@@ -243,6 +269,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			sources.getSource(PERFORMANCE_SOURCE).api
 		);
 
+		this.updateTsdbHealthMetrics();
 		this.restartScraper();
 		this.restartMaintenanceTimers();
 		this.pruneOldSamples();
@@ -497,6 +524,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			}
 			new Notice(message + " Change port in plugin settings.", 8000);
 		}
+		this.updateTsdbHealthMetrics();
 		this.updateStatusBar();
 	}
 
@@ -504,6 +532,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		if (!this.apiServer?.listening) return;
 		await this.apiServer.close();
 		if (!silent) new Notice("Metrics server stopped");
+		this.updateTsdbHealthMetrics();
 		this.updateStatusBar();
 	}
 
@@ -557,6 +586,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				const order = new Map([
 					[VAULT_SOURCE, 0],
 					[PERFORMANCE_SOURCE, 1],
+					[TSDB_SOURCE, 2],
 				]);
 				return (
 					(order.get(a.name) ?? 100) - (order.get(b.name) ?? 100) ||
@@ -683,23 +713,41 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private async ingestDurably(samples: StoredSample[]): Promise<void> {
 		const task = this.ingestDurablyTracked(samples);
 		this.inFlightIngests.add(task);
+		this.updateTsdbHealthMetrics();
 		task.then(
-			() => this.inFlightIngests.delete(task),
-			() => this.inFlightIngests.delete(task)
+			() => {
+				this.inFlightIngests.delete(task);
+				this.updateTsdbHealthMetrics();
+			},
+			() => {
+				this.inFlightIngests.delete(task);
+				this.updateTsdbHealthMetrics();
+			}
 		);
 		return task;
 	}
 
 	private async ingestDurablyTracked(samples: StoredSample[]): Promise<void> {
 		if (!this.store) return;
+		const started = performance.now();
 		try {
 			await this.store.ingest(samples);
+			this.tsdbMetrics?.recordIngest(
+				samples.length,
+				(performance.now() - started) / 1000,
+				"ok"
+			);
 			this.storeHealth.lastIngestMs = Date.now();
 			this.storeHealth.lastIngestSampleCount = samples.length;
 			this.storeHealth.lastIngestError = null;
 			this.storeHealth.lastIngestErrorMs = null;
 			this.wal?.append(samples);
 		} catch (error) {
+			this.tsdbMetrics?.recordIngest(
+				samples.length,
+				(performance.now() - started) / 1000,
+				"error"
+			);
 			this.storeHealth.lastIngestError = String(error);
 			this.storeHealth.lastIngestErrorMs = Date.now();
 			throw error;
@@ -718,6 +766,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	 */
 	async flushStore(): Promise<void> {
 		if (!this.wal) return;
+		const started = performance.now();
+		let status: "ok" | "error" | "skipped" = "ok";
 		try {
 			const epoch = this.wal.epoch;
 			await this.wal.barrier();
@@ -725,7 +775,13 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				await this.wal.truncate();
 			}
 		} catch (error) {
+			status = "error";
 			console.error("tsdb: WAL checkpoint failed", error);
+		} finally {
+			this.tsdbMetrics?.recordWalCheckpoint(
+				(performance.now() - started) / 1000,
+				status
+			);
 		}
 	}
 
@@ -738,6 +794,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	}
 
 	getHealthStatus(): ApiHealthStatus {
+		this.updateTsdbHealthMetrics();
 		const storeOpen = this.store?.isOpen ?? false;
 		const queryEngineReady = this.engine !== null;
 		const ok =
@@ -755,6 +812,15 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			lastIngestErrorMs: this.storeHealth.lastIngestErrorMs,
 			inFlightIngests: this.inFlightIngests.size,
 		};
+	}
+
+	private updateTsdbHealthMetrics(): void {
+		this.tsdbMetrics?.setHealth({
+			storeOpen: this.store?.isOpen ?? false,
+			queryEngineReady: this.engine !== null,
+			apiServerRunning: this.apiServer?.listening ?? false,
+			inFlightIngests: this.inFlightIngests.size,
+		});
 	}
 
 	// -- misc ----------------------------------------------------------------

@@ -27,6 +27,7 @@ export interface StoreOptions {
 
 export const VAULT_SOURCE = "vault";
 export const PERFORMANCE_SOURCE = "performance";
+export const TSDB_SOURCE = "tsdb";
 
 /** Stores registered without an interval record at 1s. */
 export const DEFAULT_STORE_INTERVAL_SECONDS = 1;
@@ -34,6 +35,7 @@ export const DEFAULT_STORE_INTERVAL_SECONDS = 1;
 export const DEFAULT_SOURCE_INTERVALS: Record<string, number> = {
 	[VAULT_SOURCE]: 30,
 	[PERFORMANCE_SOURCE]: 30,
+	[TSDB_SOURCE]: 30,
 };
 
 export class MetricSourceRegistry {
