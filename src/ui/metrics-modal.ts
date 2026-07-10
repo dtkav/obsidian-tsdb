@@ -25,8 +25,12 @@ export class MetricsModal extends Modal {
 				const oldest = stats.oldestSampleMs
 					? new Date(stats.oldestSampleMs).toLocaleString()
 					: "n/a";
+				const samples =
+					stats.sampleCount === null
+						? "sample count pending"
+						: `${stats.sampleCount} samples`;
 				statsLine.textContent =
-					`Stored: ${stats.seriesCount} series, ${stats.sampleCount} samples ` +
+					`Stored: ${stats.seriesCount} series, ${samples} ` +
 					`(oldest: ${oldest})`;
 			} else {
 				statsLine.textContent = "Local metrics database not running.";

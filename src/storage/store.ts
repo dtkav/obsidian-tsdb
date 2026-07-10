@@ -38,6 +38,20 @@ export interface StoreStats {
 	samplesLastHour: number;
 }
 
+export interface QuickStoreStats {
+	seriesCount: number;
+	/**
+	 * Null when answering quickly would require scanning the samples table.
+	 * Use stats() only in offline/explicit diagnostics that can afford a full
+	 * table count.
+	 */
+	sampleCount: number | null;
+	oldestSampleMs: number | null;
+	newestSampleMs: number | null;
+	sizeBytes: number;
+	samplesLastHour: number | null;
+}
+
 export interface OpenOptions {
 	/** Embedded wasm binary; omitted in tests (loaded from disk). */
 	wasmBinary?: ArrayBuffer | Uint8Array;
@@ -74,6 +88,11 @@ const CHUNK_VFS_NAME = "tsdb-chunks";
 const NODE_FILE_VFS_NAME = "tsdb-node-file";
 export const DEFAULT_CHUNK_DB_NAME = "metrics";
 export const DEFAULT_NODE_DB_NAME = "metrics.sqlite";
+const META_SAMPLE_COUNT = "sample_count";
+const META_OLDEST_SAMPLE_MS = "oldest_sample_ms";
+const META_NEWEST_SAMPLE_MS = "newest_sample_ms";
+const META_ROLLUP_1M_STARTED_MS = "rollup_1m_started_ms";
+const ROLLUP_BUCKET_MS = 60_000;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
@@ -88,6 +107,14 @@ CREATE TABLE IF NOT EXISTS samples (
 	PRIMARY KEY (series_id, ts)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);
+CREATE TABLE IF NOT EXISTS store_meta (
+	key TEXT PRIMARY KEY,
+	value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sample_rollup_1m (
+	bucket_ms INTEGER PRIMARY KEY,
+	sample_count INTEGER NOT NULL
+);
 `;
 
 /**
@@ -106,6 +133,7 @@ export class MetricsStore {
 	private allSeries: CachedSeries[] = [];
 	private insertSeriesStmt: number | null = null;
 	private insertSampleStmt: number | null = null;
+	private updateSampleStmt: number | null = null;
 
 	/**
 	 * wa-sqlite's Asyncify build forbids reentrant calls: while one
@@ -188,6 +216,7 @@ export class MetricsStore {
 		await this.sqlite3.exec(this.db, "PRAGMA cache_size=-4096"); // 4 MiB
 		await this.sqlite3.exec(this.db, SCHEMA);
 		await this.loadSeriesCache();
+		await this.initializeStatsMetadata();
 	}
 
 	/** Run `fn` against the single prepared statement in `sql`. */
@@ -230,10 +259,19 @@ export class MetricsStore {
 	private async getInsertSampleStmt(): Promise<number> {
 		if (this.insertSampleStmt === null) {
 			this.insertSampleStmt = await this.prepareStatement(
-				"INSERT OR REPLACE INTO samples (series_id, ts, value) VALUES (?, ?, ?)"
+				"INSERT OR IGNORE INTO samples (series_id, ts, value) VALUES (?, ?, ?)"
 			);
 		}
 		return this.insertSampleStmt;
+	}
+
+	private async getUpdateSampleStmt(): Promise<number> {
+		if (this.updateSampleStmt === null) {
+			this.updateSampleStmt = await this.prepareStatement(
+				"UPDATE samples SET value = ? WHERE series_id = ? AND ts = ?"
+			);
+		}
+		return this.updateSampleStmt;
 	}
 
 	private async resetPreparedStatement(stmt: number): Promise<void> {
@@ -248,6 +286,7 @@ export class MetricsStore {
 	private async discardPreparedStatement(stmt: number): Promise<void> {
 		if (this.insertSeriesStmt === stmt) this.insertSeriesStmt = null;
 		if (this.insertSampleStmt === stmt) this.insertSampleStmt = null;
+		if (this.updateSampleStmt === stmt) this.updateSampleStmt = null;
 		await this.sqlite3.finalize(stmt).catch(() => undefined);
 	}
 
@@ -266,6 +305,178 @@ export class MetricsStore {
 				this.allSeries.push(cached);
 			}
 		);
+	}
+
+	private async initializeStatsMetadata(): Promise<void> {
+		if ((await this.getMetaNumber(META_SAMPLE_COUNT)) !== null) return;
+
+		let hasSamples = false;
+		await this.sqlite3.exec(this.db, "SELECT 1 FROM samples LIMIT 1", () => {
+			hasSamples = true;
+		});
+		if (hasSamples) return;
+
+		await this.setMetaNumber(META_SAMPLE_COUNT, 0);
+		await this.setMetaNumber(
+			META_ROLLUP_1M_STARTED_MS,
+			bucketStart(Date.now() - 3600_000)
+		);
+	}
+
+	private async getMetaNumber(key: string): Promise<number | null> {
+		let value: number | null = null;
+		await this.withStatement(
+			"SELECT value FROM store_meta WHERE key = ?",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [key]);
+				if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+					value = this.sqlite3.row(stmt)[0] as number;
+				}
+			}
+		);
+		return value;
+	}
+
+	private async setMetaNumber(key: string, value: number): Promise<void> {
+		await this.withStatement(
+			"INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [key, Math.trunc(value)]);
+				await this.sqlite3.step(stmt);
+			}
+		);
+	}
+
+	private async setMetaMinNumber(key: string, value: number): Promise<void> {
+		await this.withStatement(
+			"INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = min(value, excluded.value)",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [key, Math.trunc(value)]);
+				await this.sqlite3.step(stmt);
+			}
+		);
+	}
+
+	private async setMetaMaxNumber(key: string, value: number): Promise<void> {
+		await this.withStatement(
+			"INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [key, Math.trunc(value)]);
+				await this.sqlite3.step(stmt);
+			}
+		);
+	}
+
+	private async deleteMetaNumbers(keys: string[]): Promise<void> {
+		if (keys.length === 0) return;
+		await this.withStatement(
+			"DELETE FROM store_meta WHERE key = ?",
+			async (stmt) => {
+				for (const key of keys) {
+					this.sqlite3.bind_collection(stmt, [key]);
+					await this.sqlite3.step(stmt);
+					await this.resetPreparedStatement(stmt);
+				}
+			}
+		);
+	}
+
+	private async incrementKnownMetaNumber(
+		key: string,
+		delta: number
+	): Promise<boolean> {
+		await this.withStatement(
+			"UPDATE store_meta SET value = max(0, value + ?) WHERE key = ?",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [Math.trunc(delta), key]);
+				await this.sqlite3.step(stmt);
+			}
+		);
+		return this.sqlite3.changes(this.db) > 0;
+	}
+
+	private async refreshKnownSampleBounds(): Promise<void> {
+		let oldest: number | null = null;
+		let newest: number | null = null;
+		await this.sqlite3.exec(
+			this.db,
+			"SELECT ts FROM samples ORDER BY ts ASC LIMIT 1",
+			(row) => {
+				oldest = row[0] as number;
+			}
+		);
+		await this.sqlite3.exec(
+			this.db,
+			"SELECT ts FROM samples ORDER BY ts DESC LIMIT 1",
+			(row) => {
+				newest = row[0] as number;
+			}
+		);
+		if (oldest === null || newest === null) {
+			await this.deleteMetaNumbers([
+				META_OLDEST_SAMPLE_MS,
+				META_NEWEST_SAMPLE_MS,
+			]);
+			return;
+		}
+		await this.setMetaNumber(META_OLDEST_SAMPLE_MS, oldest);
+		await this.setMetaNumber(META_NEWEST_SAMPLE_MS, newest);
+	}
+
+	private async addRollupCounts(
+		bucketCounts: Map<number, number>
+	): Promise<void> {
+		if (bucketCounts.size === 0) return;
+		await this.withStatement(
+			"INSERT INTO sample_rollup_1m (bucket_ms, sample_count) VALUES (?, ?) ON CONFLICT(bucket_ms) DO UPDATE SET sample_count = sample_count + excluded.sample_count",
+			async (stmt) => {
+				for (const [bucketMs, count] of bucketCounts) {
+					this.sqlite3.bind_collection(stmt, [bucketMs, count]);
+					await this.sqlite3.step(stmt);
+					await this.resetPreparedStatement(stmt);
+				}
+			}
+		);
+	}
+
+	private async subtractRollupCounts(
+		bucketCounts: Map<number, number>
+	): Promise<void> {
+		if (bucketCounts.size === 0) return;
+		await this.withStatement(
+			"UPDATE sample_rollup_1m SET sample_count = max(0, sample_count - ?) WHERE bucket_ms = ?",
+			async (stmt) => {
+				for (const [bucketMs, count] of bucketCounts) {
+					this.sqlite3.bind_collection(stmt, [count, bucketMs]);
+					await this.sqlite3.step(stmt);
+					await this.resetPreparedStatement(stmt);
+				}
+			}
+		);
+		await this.sqlite3.exec(
+			this.db,
+			"DELETE FROM sample_rollup_1m WHERE sample_count <= 0"
+		);
+	}
+
+	private async collectRollupCountsBefore(
+		cutoffMs: number
+	): Promise<Map<number, number>> {
+		const bucketCounts = new Map<number, number>();
+		await this.withStatement(
+			"SELECT ts - (ts % ?), count(*) FROM samples WHERE ts < ? GROUP BY 1",
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [
+					ROLLUP_BUCKET_MS,
+					Math.floor(cutoffMs),
+				]);
+				while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+					const row = this.sqlite3.row(stmt);
+					bucketCounts.set(row[0] as number, row[1] as number);
+				}
+			}
+		);
+		return bucketCounts;
 	}
 
 	private async createMissingSeries(rows: IngestRow[]): Promise<void> {
@@ -321,17 +532,62 @@ export class MetricsStore {
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
 			await this.createMissingSeries(rows);
-			const stmt = await this.getInsertSampleStmt();
+			const insertStmt = await this.getInsertSampleStmt();
+			const updateStmt = await this.getUpdateSampleStmt();
+			let insertedRows = 0;
+			let oldestInserted: number | null = null;
+			let newestInserted: number | null = null;
+			const bucketCounts = new Map<number, number>();
 			for (const row of rows) {
 				const seriesId = this.seriesByKey.get(row.seriesKey)?.id;
 				if (seriesId === undefined) {
 					throw new Error("tsdb: series cache miss during ingest");
 				}
-				this.sqlite3.bind_collection(stmt, [seriesId, row.ts, row.value]);
+				this.sqlite3.bind_collection(insertStmt, [seriesId, row.ts, row.value]);
+				let inserted = false;
 				try {
-					await this.sqlite3.step(stmt);
+					await this.sqlite3.step(insertStmt);
+					inserted = this.sqlite3.changes(this.db) > 0;
 				} finally {
-					await this.resetPreparedStatement(stmt);
+					await this.resetPreparedStatement(insertStmt);
+				}
+				if (inserted) {
+					insertedRows++;
+					oldestInserted =
+						oldestInserted === null ? row.ts : Math.min(oldestInserted, row.ts);
+					newestInserted =
+						newestInserted === null ? row.ts : Math.max(newestInserted, row.ts);
+					const bucketMs = bucketStart(row.ts);
+					bucketCounts.set(bucketMs, (bucketCounts.get(bucketMs) ?? 0) + 1);
+					continue;
+				}
+
+				this.sqlite3.bind_collection(updateStmt, [row.value, seriesId, row.ts]);
+				try {
+					await this.sqlite3.step(updateStmt);
+				} finally {
+					await this.resetPreparedStatement(updateStmt);
+				}
+			}
+			if (insertedRows > 0) {
+				const metadataKnown = await this.incrementKnownMetaNumber(
+					META_SAMPLE_COUNT,
+					insertedRows
+				);
+				if (metadataKnown) {
+					if (oldestInserted !== null) {
+						await this.setMetaMinNumber(
+							META_OLDEST_SAMPLE_MS,
+							oldestInserted
+						);
+					}
+					if (newestInserted !== null) {
+						await this.setMetaMaxNumber(
+							META_NEWEST_SAMPLE_MS,
+							newestInserted
+						);
+					}
+					await this.addRollupCounts(bucketCounts);
 				}
 			}
 			await this.sqlite3.exec(this.db, "COMMIT");
@@ -456,13 +712,30 @@ export class MetricsStore {
 	private async deleteBeforeLocked(cutoffMs: number): Promise<void> {
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
+			const hasRollups =
+				(await this.getMetaNumber(META_ROLLUP_1M_STARTED_MS)) !== null;
+			const deletedBuckets = hasRollups
+				? await this.collectRollupCountsBefore(cutoffMs)
+				: new Map<number, number>();
+			let deletedRows = 0;
 			await this.withStatement(
 				"DELETE FROM samples WHERE ts < ?",
 				async (stmt) => {
 					this.sqlite3.bind_collection(stmt, [Math.floor(cutoffMs)]);
 					await this.sqlite3.step(stmt);
+					deletedRows = this.sqlite3.changes(this.db);
 				}
 			);
+			if (deletedRows > 0) {
+				const metadataKnown = await this.incrementKnownMetaNumber(
+					META_SAMPLE_COUNT,
+					-deletedRows
+				);
+				if (metadataKnown) {
+					await this.refreshKnownSampleBounds();
+					if (hasRollups) await this.subtractRollupCounts(deletedBuckets);
+				}
+			}
 			await this.sqlite3.exec(
 				this.db,
 				"DELETE FROM series WHERE id NOT IN (SELECT DISTINCT series_id FROM samples)"
@@ -477,6 +750,45 @@ export class MetricsStore {
 
 	stats(): Promise<StoreStats> {
 		return this.enqueue(() => this.statsLocked());
+	}
+
+	quickStats(): Promise<QuickStoreStats> {
+		return this.enqueue(() => this.quickStatsLocked());
+	}
+
+	private async quickStatsLocked(): Promise<QuickStoreStats> {
+		const stats: QuickStoreStats = {
+			seriesCount: this.allSeries.length,
+			sampleCount: await this.getMetaNumber(META_SAMPLE_COUNT),
+			oldestSampleMs: await this.getMetaNumber(META_OLDEST_SAMPLE_MS),
+			newestSampleMs: await this.getMetaNumber(META_NEWEST_SAMPLE_MS),
+			sizeBytes: 0,
+			samplesLastHour: null,
+		};
+		await this.sqlite3.exec(
+			this.db,
+			"SELECT (SELECT * FROM pragma_page_count()) * (SELECT * FROM pragma_page_size())",
+			(row) => {
+				stats.sizeBytes = (row[0] as number) ?? 0;
+			}
+		);
+		const hourAgo = Date.now() - 3600_000;
+		const rollupStartedMs = await this.getMetaNumber(
+			META_ROLLUP_1M_STARTED_MS
+		);
+		if (rollupStartedMs !== null && rollupStartedMs <= bucketStart(hourAgo)) {
+			await this.withStatement(
+				"SELECT coalesce(sum(sample_count), 0) FROM sample_rollup_1m WHERE bucket_ms >= ?",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [bucketStart(hourAgo)]);
+					if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+						stats.samplesLastHour =
+							(this.sqlite3.row(stmt)[0] as number) ?? 0;
+					}
+				}
+			);
+		}
+		return stats;
 	}
 
 	private async statsLocked(): Promise<StoreStats> {
@@ -539,13 +851,22 @@ export class MetricsStore {
 	}
 
 	private async finalizePreparedStatements(): Promise<void> {
-		const stmts = [this.insertSeriesStmt, this.insertSampleStmt];
+		const stmts = [
+			this.insertSeriesStmt,
+			this.insertSampleStmt,
+			this.updateSampleStmt,
+		];
 		this.insertSeriesStmt = null;
 		this.insertSampleStmt = null;
+		this.updateSampleStmt = null;
 		for (const stmt of stmts) {
 			if (stmt !== null) await this.sqlite3.finalize(stmt);
 		}
 	}
+}
+
+function bucketStart(ts: number): number {
+	return Math.floor(ts / ROLLUP_BUCKET_MS) * ROLLUP_BUCKET_MS;
 }
 
 function createVfs(vfsName: string, location: StoreLocation) {

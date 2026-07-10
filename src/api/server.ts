@@ -330,7 +330,7 @@ export class ApiServer {
 				return;
 			}
 			case "/api/v1/status/tsdb": {
-				const stats = await store.stats();
+				const stats = await store.quickStats();
 				this.success(res, {
 					headStats: {
 						numSeries: stats.seriesCount,

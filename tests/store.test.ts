@@ -218,6 +218,29 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		await store.close();
 	});
 
+	it("maintains quick stats on the write path", async () => {
+		const { store } = await openStore();
+		const now = Date.now();
+		await store.ingest([
+			{ labels: { [NAME]: "m" }, ts: now - 120_000, value: 1 },
+			{ labels: { [NAME]: "m" }, ts: now - 1_000, value: 2 },
+			{ labels: { [NAME]: "m" }, ts: now - 1_000, value: 3 },
+		]);
+
+		let quick = await store.quickStats();
+		expect(quick.sampleCount).toBe(2);
+		expect(quick.samplesLastHour).toBe(2);
+		expect(quick.oldestSampleMs).toBe(Math.round(now - 120_000));
+		expect(quick.newestSampleMs).toBe(Math.round(now - 1_000));
+
+		await store.deleteBefore(now - 60_000);
+		quick = await store.quickStats();
+		expect(quick.sampleCount).toBe(1);
+		expect(quick.samplesLastHour).toBe(1);
+		expect(quick.oldestSampleMs).toBe(Math.round(now - 1_000));
+		await store.close();
+	});
+
 	it("serializes concurrent operations (Asyncify forbids reentrancy)", async () => {
 		const { store } = await openStore();
 		const batch = (name: string, base: number) =>

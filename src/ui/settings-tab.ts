@@ -153,9 +153,16 @@ export class MetricsSettingTab extends PluginSettingTab {
 			const parts = [
 				`${formatUnitValue(stats.sizeBytes, "bytes")}`,
 				`${stats.seriesCount.toLocaleString()} series`,
-				`${stats.sampleCount.toLocaleString()} samples`,
+				stats.sampleCount === null
+					? "sample count pending"
+					: `${stats.sampleCount.toLocaleString()} samples`,
 			];
-			if (stats.samplesLastHour > 0 && stats.sampleCount > 0) {
+			if (
+				stats.samplesLastHour !== null &&
+				stats.sampleCount !== null &&
+				stats.samplesLastHour > 0 &&
+				stats.sampleCount > 0
+			) {
 				const bytesPerDay =
 					(stats.sizeBytes / stats.sampleCount) * stats.samplesLastHour * 24;
 				parts.push(`growing ≈${formatUnitValue(bytesPerDay, "bytes")}/day`);

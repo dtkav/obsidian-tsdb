@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { StoredSample } from "../src/storage/store";
+import type { MetricsStore, StoredSample } from "../src/storage/store";
 import { SampleWal, WalAdapter } from "../src/storage/wal";
+import { maintainStartupWal } from "../src/storage/wal-maintenance";
 
 function makeAdapter(): WalAdapter & { files: Map<string, string> } {
 	const files = new Map<string, string>();
@@ -149,5 +150,27 @@ describe("SampleWal", () => {
 		expect(result.samples).toBe(1);
 		expect(result.batches).toBe(1);
 		expect(sink.ingested.map((s) => s.labels.__name__)).toEqual(["a"]);
+	});
+
+	it("checkpoints a healthy startup WAL without replay", async () => {
+		const adapter = makeAdapter();
+		const wal = new SampleWal(adapter, "metrics.wal");
+		for (let i = 0; i < 1000; i++) {
+			wal.append([sample("a", i * 1000, i)]);
+		}
+		await wal.barrier();
+		expect(adapter.files.get("metrics.wal")!.length).toBeGreaterThan(10_000);
+
+		const store = { recoveredFromCorruption: false } as MetricsStore;
+		const result = await maintainStartupWal(wal, store);
+
+		expect(result).toEqual({
+			mode: "checkpoint",
+			samples: 0,
+			batches: 0,
+			bytes: 0,
+			aborted: false,
+		});
+		expect(adapter.files.get("metrics.wal")).toBe("");
 	});
 });
