@@ -304,6 +304,33 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		expect(one[0].points).toHaveLength(50);
 		await store.close();
 	});
+
+	it("batches wide selects across many matching series", async () => {
+		const { store } = await openStore();
+		const batch = Array.from({ length: 325 }, (_, i) => ({
+			labels: { [NAME]: "fanout", idx: String(i) },
+			ts: 1000,
+			value: i,
+		}));
+		await store.ingest(batch);
+
+		const data = await store.select(
+			[{ name: NAME, op: "=", value: "fanout" }],
+			0,
+			2000
+		);
+
+		expect(data).toHaveLength(325);
+		expect(data[0]).toEqual({
+			labels: { [NAME]: "fanout", idx: "0" },
+			points: [{ t: 1000, v: 0 }],
+		});
+		expect(data[324]).toEqual({
+			labels: { [NAME]: "fanout", idx: "324" },
+			points: [{ t: 1000, v: 324 }],
+		});
+		await store.close();
+	});
 });
 
 describe("MetricsStore (wa-sqlite over Node file VFS)", () => {

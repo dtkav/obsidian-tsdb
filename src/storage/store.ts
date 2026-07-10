@@ -93,6 +93,7 @@ const META_OLDEST_SAMPLE_MS = "oldest_sample_ms";
 const META_NEWEST_SAMPLE_MS = "newest_sample_ms";
 const META_ROLLUP_1M_STARTED_MS = "rollup_1m_started_ms";
 const ROLLUP_BUCKET_MS = 60_000;
+const SELECT_SERIES_BATCH_SIZE = 250;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
@@ -620,29 +621,37 @@ export class MetricsStore {
 		const matched = this.matchSeries(matchers);
 		if (matched.length === 0) return [];
 
-		const result: SeriesData[] = [];
-		await this.withStatement(
-			"SELECT ts, value FROM samples WHERE series_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
-			async (stmt) => {
-				for (const series of matched) {
+		const pointsBySeriesId = new Map<number, Point[]>();
+		const lo = Math.floor(startMs);
+		const hi = Math.ceil(endMs);
+		for (let i = 0; i < matched.length; i += SELECT_SERIES_BATCH_SIZE) {
+			const batch = matched.slice(i, i + SELECT_SERIES_BATCH_SIZE);
+			const placeholders = batch.map(() => "?").join(",");
+			await this.withStatement(
+				`SELECT series_id, ts, value FROM samples WHERE series_id IN (${placeholders}) AND ts >= ? AND ts <= ? ORDER BY series_id, ts`,
+				async (stmt) => {
 					this.sqlite3.bind_collection(stmt, [
-						series.id,
-						Math.floor(startMs),
-						Math.ceil(endMs),
+						...batch.map((series) => series.id),
+						lo,
+						hi,
 					]);
-					const points: Point[] = [];
 					while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
 						const row = this.sqlite3.row(stmt);
-						points.push({ t: row[0] as number, v: row[1] as number });
-					}
-					await this.sqlite3.reset(stmt);
-					if (points.length > 0) {
-						result.push({ labels: series.labels, points });
+						const seriesId = row[0] as number;
+						const points = pointsBySeriesId.get(seriesId) ?? [];
+						points.push({ t: row[1] as number, v: row[2] as number });
+						pointsBySeriesId.set(seriesId, points);
 					}
 				}
-			}
-		);
-		return result;
+			);
+		}
+
+		return matched.flatMap((series) => {
+			const points = pointsBySeriesId.get(series.id);
+			return points && points.length > 0
+				? [{ labels: series.labels, points }]
+				: [];
+		});
 	}
 
 	seriesMatching(
