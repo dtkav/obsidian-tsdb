@@ -12,7 +12,7 @@ directory, run:
 make -C /path/to/wa-sqlite \
   -f /path/to/sqlite-tsdb/adapters/wa-sqlite/wa-sqlite.mk \
   SQLITE_TSDB_DIR=/path/to/sqlite-tsdb \
-  dist/wa-sqlite-async.mjs
+  dist/wa-sqlite.mjs dist/wa-sqlite-async.mjs
 ```
 
 For the published wa-sqlite `1.0.0` npm package used by the Obsidian plugin,
@@ -24,7 +24,7 @@ the later Git `v1.0.0` tag does not:
 make -C /path/to/wa-sqlite-1.0.0 \
   -f /path/to/sqlite-tsdb/adapters/wa-sqlite/wa-sqlite-v1.mk \
   SQLITE_TSDB_DIR=/path/to/sqlite-tsdb \
-  dist/wa-sqlite-async.mjs
+  dist/wa-sqlite.mjs dist/wa-sqlite-async.mjs
 ```
 
 The output `.mjs` and `.wasm` files are wa-sqlite artifacts with the TSDB code
@@ -59,6 +59,11 @@ Obsidian should keep the labels/series catalog in normal SQLite tables. Only
 numeric samples belong in the TSDB virtual table. Packed `TSI1` input avoids a
 JavaScript-to-Wasm call per sample, and `tsdb_pack()` avoids a Wasm-to-JavaScript
 callback per result point.
+
+Use the regular `wa-sqlite.mjs` build with a synchronous VFS such as
+`AccessHandlePoolVFS`. Reserve `wa-sqlite-async.mjs` for VFS implementations
+whose methods return promises. The module factory and minimized Wasm binary
+must always come from the same build pair.
 
 Run the boundary-aware benchmark against the generated artifact with:
 

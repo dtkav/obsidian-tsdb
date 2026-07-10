@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WA_SQLITE_DIR="${TSDB_WA_SQLITE_DIR:-/tmp/obsidian-metrics-wa-sqlite}"
 WA_SQLITE_COMMIT="a110948636473279dd3590f0b980bc9c6a9d6407"
 EMSDK_IMAGE="emscripten/emsdk:3.1.25"
+TSDB_OPT_LEVEL="${TSDB_OPT_LEVEL:--Oz}"
 
 if [[ ! -d "$WA_SQLITE_DIR/.git" ]]; then
 	git clone https://github.com/rhashimoto/wa-sqlite.git "$WA_SQLITE_DIR"
@@ -27,8 +28,14 @@ docker run --rm \
 	-w /wa-sqlite \
 	"$EMSDK_IMAGE" \
 	make -f /sqlite-tsdb/adapters/wa-sqlite/wa-sqlite-v1.mk \
-		SQLITE_TSDB_DIR=/sqlite-tsdb dist/wa-sqlite-async.mjs
+		SQLITE_TSDB_DIR=/sqlite-tsdb \
+		TSDB_OPT_LEVEL="$TSDB_OPT_LEVEL" \
+		dist/wa-sqlite.mjs dist/wa-sqlite-async.mjs
 
+cp "$WA_SQLITE_DIR/dist/wa-sqlite.mjs" \
+	"$ROOT_DIR/node_modules/wa-sqlite/dist/wa-sqlite.mjs"
+cp "$WA_SQLITE_DIR/dist/wa-sqlite.wasm" \
+	"$ROOT_DIR/node_modules/wa-sqlite/dist/wa-sqlite.wasm"
 cp "$WA_SQLITE_DIR/dist/wa-sqlite-async.mjs" \
 	"$ROOT_DIR/node_modules/wa-sqlite/dist/wa-sqlite-async.mjs"
 cp "$WA_SQLITE_DIR/dist/wa-sqlite-async.wasm" \

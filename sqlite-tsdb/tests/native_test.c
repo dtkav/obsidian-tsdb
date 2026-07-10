@@ -63,16 +63,21 @@ static void assert_integrity(sqlite3 *db) {
     sqlite3_finalize(statement);
 }
 
-static void assert_value(sqlite3 *db, sqlite3_int64 ts, double expected) {
+static void assert_value(
+    sqlite3 *db,
+    sqlite3_int64 series_id,
+    sqlite3_int64 ts,
+    double expected) {
     sqlite3_stmt *statement = NULL;
     double actual;
     assert(sqlite3_prepare_v2(
                db,
-               "SELECT value FROM samples WHERE series_id=1 AND ts=?1",
+               "SELECT value FROM samples WHERE series_id=?1 AND ts=?2",
                -1,
                &statement,
                NULL) == SQLITE_OK);
-    sqlite3_bind_int64(statement, 1, ts);
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, ts);
     assert(sqlite3_step(statement) == SQLITE_ROW);
     actual = sqlite3_column_double(statement, 0);
     assert(memcmp(&actual, &expected, sizeof(actual)) == 0);
@@ -86,6 +91,7 @@ int main(void) {
     int i;
     unsigned char batch[16 + 3 * 24];
     sqlite3_stmt *batch_insert = NULL;
+    sqlite3_stmt *direct_batch_insert = NULL;
     sqlite3_stmt *pack_query = NULL;
     TsdbCodecPoint *packed_points = NULL;
     uint32_t packed_count = 0;
@@ -124,15 +130,15 @@ int main(void) {
     assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 0);
     assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") > 0);
     assert(scalar_i64(db, "SELECT count(*) FROM samples") == 20);
-    assert_value(db, 300, -0.0);
+    assert_value(db, 1, 300, -0.0);
 
     execute(db, "INSERT INTO samples(series_id,ts,value) VALUES(1,300,99.5)");
-    assert_value(db, 300, 99.5);
+    assert_value(db, 1, 300, 99.5);
     execute(
         db,
         "INSERT INTO samples(control,arg1,arg2) "
         "VALUES('compact-before',2000,100)");
-    assert_value(db, 300, 99.5);
+    assert_value(db, 1, 300, 99.5);
     assert(scalar_i64(db, "SELECT count(*) FROM samples") == 20);
     assert(scalar_i64(
                db,
@@ -172,6 +178,74 @@ int main(void) {
     assert(sqlite3_step(batch_insert) == SQLITE_DONE);
     sqlite3_finalize(batch_insert);
     assert(scalar_i64(db, "SELECT count(*) FROM samples WHERE series_id=3") == 3);
+
+    put_u64(batch + 16, 3);
+    put_u64(batch + 16 + 8, 3000);
+    put_u64(batch + 16 + 16, tsdb_double_to_bits(99.5));
+    for (i = 1; i < 3; ++i) {
+        unsigned char *record = batch + 16 + i * 24;
+        put_u64(record, 4);
+        put_u64(record + 8, (uint64_t)(3900 + i * 100));
+        put_u64(record + 16, tsdb_double_to_bits((double)i + 20.5));
+    }
+    assert(sqlite3_prepare_v2(
+               db,
+               "INSERT INTO samples(control,arg1,arg2) "
+               "VALUES('ingest-batch',?1,0)",
+               -1,
+               &direct_batch_insert,
+               NULL) == SQLITE_OK);
+    sqlite3_bind_blob(direct_batch_insert, 1, batch, sizeof(batch), SQLITE_STATIC);
+    assert(sqlite3_step(direct_batch_insert) == SQLITE_DONE);
+    sqlite3_finalize(direct_batch_insert);
+    direct_batch_insert = NULL;
+    assert(scalar_i64(db, "SELECT sum(sample_count) FROM samples_changes") == 2);
+    assert_value(db, 3, 3000, 10.5);
+
+    assert(sqlite3_prepare_v2(
+               db,
+               "INSERT INTO samples(control,arg1,arg2) "
+               "VALUES('ingest-batch',?1,1)",
+               -1,
+               &direct_batch_insert,
+               NULL) == SQLITE_OK);
+    sqlite3_bind_blob(direct_batch_insert, 1, batch, sizeof(batch), SQLITE_STATIC);
+    assert(sqlite3_step(direct_batch_insert) == SQLITE_DONE);
+    sqlite3_finalize(direct_batch_insert);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_changes") == 0);
+    assert_value(db, 3, 3000, 99.5);
+
+    execute(
+        db,
+        "INSERT INTO samples(control,arg1,arg2) "
+        "VALUES('compact-before',5000,100)");
+    put_u64(batch + 16 + 16, tsdb_double_to_bits(77.25));
+    assert(sqlite3_prepare_v2(
+               db,
+               "INSERT INTO samples(control,arg1,arg2) "
+               "VALUES('ingest-batch',?1,0)",
+               -1,
+               &direct_batch_insert,
+               NULL) == SQLITE_OK);
+    sqlite3_bind_blob(direct_batch_insert, 1, batch, sizeof(batch), SQLITE_STATIC);
+    assert(sqlite3_step(direct_batch_insert) == SQLITE_DONE);
+    sqlite3_finalize(direct_batch_insert);
+    direct_batch_insert = NULL;
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_changes") == 0);
+    assert_value(db, 3, 3000, 99.5);
+
+    assert(sqlite3_prepare_v2(
+               db,
+               "INSERT INTO samples(control,arg1,arg2) "
+               "VALUES('ingest-batch',?1,1)",
+               -1,
+               &direct_batch_insert,
+               NULL) == SQLITE_OK);
+    sqlite3_bind_blob(direct_batch_insert, 1, batch, sizeof(batch), SQLITE_STATIC);
+    assert(sqlite3_step(direct_batch_insert) == SQLITE_DONE);
+    sqlite3_finalize(direct_batch_insert);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_changes") == 0);
+    assert_value(db, 3, 3000, 77.25);
 
     assert(sqlite3_prepare_v2(
                db,

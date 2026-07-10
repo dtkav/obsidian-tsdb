@@ -9,22 +9,34 @@ These are development measurements, not cross-machine claims. Raw JSON is in
 
 ## Wasm Boundary
 
-Measured through wa-sqlite's JavaScript API using the async Wasm artifact,
-with 50 series and 720 thirty-second scrapes (36,000 samples):
+Measured through wa-sqlite's JavaScript API using the synchronous `-Oz` Wasm
+artifact, with 50 series and 720 thirty-second scrapes (36,000 samples). The
+table reports medians from three final runs; timing variance in the shared
+development environment is significant:
 
 | Measurement | SQLite rows | sqlite-tsdb | Ratio |
 | --- | ---: | ---: | ---: |
-| Ingest | 1,318.3 ms | 697.0 ms | 0.53x |
-| Compaction | n/a | 561.6 ms | n/a |
-| Raw selected-series query | 24.9 ms | 49.8 ms | 2.00x |
-| Packed selected-series query | 24.9 ms | 15.7 ms | 0.63x |
-| Delete half of history | 131.7 ms | 59.9 ms | 0.45x |
+| Ingest | 443.2 ms | 356.8 ms | 0.81x |
+| Compaction | n/a | 135.0 ms | n/a |
+| Raw selected-series query | 13.0 ms | 14.6 ms | 1.12x |
+| Packed selected-series query | 13.0 ms | 8.2 ms | 0.63x |
+| Delete half of history | 32.4 ms | 22.9 ms | 0.71x |
 
-The baseline follows the plugin's existing prepared-row write path. TSDB uses
-one `TSI1` BLOB per scrape, so it crosses the JavaScript/Wasm boundary once per
-batch. TSDB ingestion plus compaction was 1,258.6 ms, slightly faster than the
-1,318.3 ms row baseline. Raw TSDB queries pay decoding overhead; packed output
-avoids one host callback per point and is the intended Obsidian query path.
+The baseline uses prepared row writes. TSDB uses one direct `TSI1` BLOB per
+scrape and reports exact newly inserted timestamps through a shadow table.
+Packed output avoids one host callback per point and is the intended Obsidian
+query path.
+
+The synchronous artifact is about 555 KB, compared with 1.14 MB for the
+Asyncify artifact. In one paired final run, synchronous TSDB ingest was
+421.5 ms versus 628.5 ms async, compaction was 92.8 ms versus 174.1 ms, and
+packed query was 6.3 ms versus 8.4 ms. The Obsidian OPFS worker therefore uses
+the synchronous artifact with `AccessHandlePoolVFS`; promise-based fallback
+VFSes retain the async build.
+
+An `-O3` comparison reduced TSDB ingest to 242-257 ms in two runs but increased
+the sync Wasm to about 1.01 MB, 83% larger than `-Oz`. The default remains
+`-Oz`; `TSDB_OPT_LEVEL=-O3` is available for size-insensitive builds.
 
 The in-memory `page_count` result at this small scale is not a storage result:
 SQLite retains freed pages until vacuum or reuse. The native file benchmarks

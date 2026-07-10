@@ -1,6 +1,7 @@
 import { MarkdownView, Notice, Plugin } from "obsidian";
 // esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
-import waSqliteWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
+import waSqliteAsyncWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
+import waSqliteSyncWasm from "wa-sqlite/dist/wa-sqlite.wasm";
 import tsdbWorkerSource from "tsdb-worker-source";
 import { installMetricsGlobal } from "./api/debug-global";
 import { ApiHealthStatus, ApiServer } from "./api/server";
@@ -648,7 +649,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			sourceStore = await MetricsStore.open({
 				location: source.location,
 				dbName: source.dbName,
-				wasmBinary: waSqliteWasm,
+				wasmBinary: waSqliteAsyncWasm,
 				recoverCorruption: false,
 			});
 			const stats = await sourceStore.quickStats();
@@ -739,7 +740,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				countStore = await MetricsStore.open({
 					location: source.location,
 					dbName: source.dbName,
-					wasmBinary: waSqliteWasm,
+					wasmBinary: waSqliteAsyncWasm,
 					recoverCorruption: false,
 				});
 				const totalSamples = await countStore.countSamples();
@@ -775,7 +776,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 						createInlineWorkerStoreTransport(tsdbWorkerSource),
 						{
 							dbName: workerPlan.dbName,
-							wasmBinary: waSqliteWasm,
+							wasmBinary: waSqliteSyncWasm,
 						}
 					);
 					console.log("tsdb: using worker OPFS backend");
@@ -807,12 +808,12 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		const storePlan = await prepareStoreOpenPlan({
 			adapter: this.app.vault.adapter,
 			pluginDir,
-			wasmBinary: waSqliteWasm,
+			wasmBinary: waSqliteAsyncWasm,
 		});
 		const store = await MetricsStore.open({
 			location: storePlan.location,
 			dbName: storePlan.dbName,
-			wasmBinary: waSqliteWasm,
+			wasmBinary: waSqliteAsyncWasm,
 		});
 		this.storageBackend = storePlan.backend;
 		return store;

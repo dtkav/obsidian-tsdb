@@ -31,9 +31,13 @@ typedef struct TsdbVtab {
     char *name;
     char *head_name;
     char *blocks_name;
+    char *changes_name;
     sqlite3_int64 block_span_ms;
     int max_block_points;
+    sqlite3_int64 cold_max_timestamp;
+    int cold_max_known;
     sqlite3_stmt *insert_head_statement;
+    sqlite3_stmt *update_head_statement;
 } TsdbVtab;
 
 typedef struct TsdbRow {
@@ -177,7 +181,9 @@ static int allocate_vtab(
     vtab->name = sqlite3_mprintf("%s", argv[2]);
     vtab->head_name = sqlite3_mprintf("%s_head", argv[2]);
     vtab->blocks_name = sqlite3_mprintf("%s_blocks", argv[2]);
-    if (!vtab->name || !vtab->head_name || !vtab->blocks_name) {
+    vtab->changes_name = sqlite3_mprintf("%s_changes", argv[2]);
+    if (!vtab->name || !vtab->head_name || !vtab->blocks_name ||
+        !vtab->changes_name) {
         tsdb_disconnect(&vtab->base);
         return SQLITE_NOMEM;
     }
@@ -262,13 +268,17 @@ static int tsdb_create(
         "codec INTEGER NOT NULL,"
         "payload BLOB NOT NULL,"
         "PRIMARY KEY(series_id, bucket_start_ms, chunk_no)) WITHOUT ROWID;"
-        "CREATE INDEX \"%w_end\" ON \"%w\"(max_ts, series_id);",
+        "CREATE INDEX \"%w_end\" ON \"%w\"(max_ts, series_id);"
+        "CREATE TABLE \"%w\"("
+        "ts INTEGER PRIMARY KEY,"
+        "sample_count INTEGER NOT NULL) WITHOUT ROWID;",
         vtab->head_name,
         vtab->head_name,
         vtab->head_name,
         vtab->blocks_name,
         vtab->blocks_name,
-        vtab->blocks_name);
+        vtab->blocks_name,
+        vtab->changes_name);
     if (rc != SQLITE_OK) {
         *error_message = sql_error ? sql_error : sqlite3_mprintf("shadow schema failed");
         tsdb_disconnect(&vtab->base);
@@ -388,7 +398,9 @@ static int tsdb_disconnect(sqlite3_vtab *base) {
     sqlite3_free(vtab->name);
     sqlite3_free(vtab->head_name);
     sqlite3_free(vtab->blocks_name);
+    sqlite3_free(vtab->changes_name);
     sqlite3_finalize(vtab->insert_head_statement);
+    sqlite3_finalize(vtab->update_head_statement);
     sqlite3_free(vtab->base.zErrMsg);
     sqlite3_free(vtab);
     return SQLITE_OK;
@@ -400,13 +412,17 @@ static int tsdb_destroy(sqlite3_vtab *base) {
     int rc;
     sqlite3_finalize(vtab->insert_head_statement);
     vtab->insert_head_statement = NULL;
+    sqlite3_finalize(vtab->update_head_statement);
+    vtab->update_head_statement = NULL;
     rc = exec_format(
         vtab->db,
         &error_message,
         "DROP TABLE IF EXISTS \"%w\";"
+        "DROP TABLE IF EXISTS \"%w\";"
         "DROP TABLE IF EXISTS \"%w\";",
         vtab->head_name,
-        vtab->blocks_name);
+        vtab->blocks_name,
+        vtab->changes_name);
     if (rc != SQLITE_OK) {
         set_vtab_error(vtab, "%s", error_message ? error_message : "drop failed");
     }
@@ -959,6 +975,11 @@ static int write_bucket_blocks(
         rc = sqlite3_step(insert_statement);
         free(payload);
         if (rc != SQLITE_DONE) break;
+        if (!vtab->cold_max_known ||
+            rows[offset + count - 1].timestamp_ms > vtab->cold_max_timestamp) {
+            vtab->cold_max_timestamp = rows[offset + count - 1].timestamp_ms;
+            vtab->cold_max_known = 1;
+        }
         sqlite3_reset(insert_statement);
         sqlite3_clear_bindings(insert_statement);
     }
@@ -1126,15 +1147,17 @@ static int insert_sample(
     TsdbVtab *vtab,
     sqlite3_int64 series_id,
     sqlite3_int64 timestamp_ms,
-    double value) {
+    double value,
+    int overwrite_existing,
+    int *inserted) {
     uint64_t bits = tsdb_double_to_bits(value);
     int rc;
     if (!vtab->insert_head_statement) {
         rc = prepare_format(
             vtab->db,
             &vtab->insert_head_statement,
-            "INSERT INTO \"%w\"(series_id,ts,value_bits) VALUES(?1,?2,?3) "
-            "ON CONFLICT(series_id,ts) DO UPDATE SET value_bits=excluded.value_bits",
+            "INSERT OR IGNORE INTO \"%w\"(series_id,ts,value_bits) "
+            "VALUES(?1,?2,?3)",
             vtab->head_name);
         if (rc != SQLITE_OK) return rc;
     }
@@ -1145,8 +1168,183 @@ static int insert_sample(
         3,
         bits_to_sql_int(bits));
     rc = sqlite3_step(vtab->insert_head_statement);
+    *inserted = rc == SQLITE_DONE && sqlite3_changes(vtab->db) > 0;
     sqlite3_reset(vtab->insert_head_statement);
     sqlite3_clear_bindings(vtab->insert_head_statement);
+    if (rc != SQLITE_DONE) return rc;
+    if (*inserted || !overwrite_existing) return SQLITE_OK;
+
+    if (!vtab->update_head_statement) {
+        rc = prepare_format(
+            vtab->db,
+            &vtab->update_head_statement,
+            "UPDATE \"%w\" SET value_bits=?3 WHERE series_id=?1 AND ts=?2",
+            vtab->head_name);
+        if (rc != SQLITE_OK) return rc;
+    }
+    sqlite3_bind_int64(vtab->update_head_statement, 1, series_id);
+    sqlite3_bind_int64(vtab->update_head_statement, 2, timestamp_ms);
+    sqlite3_bind_int64(vtab->update_head_statement, 3, bits_to_sql_int(bits));
+    rc = sqlite3_step(vtab->update_head_statement);
+    sqlite3_reset(vtab->update_head_statement);
+    sqlite3_clear_bindings(vtab->update_head_statement);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int validate_batch_blob(
+    const unsigned char *input,
+    int input_size,
+    uint32_t *record_count) {
+    sqlite3_uint64 expected_size;
+    uint32_t count;
+    if (!input || input_size < 16 ||
+        input[0] != 'T' || input[1] != 'S' || input[2] != 'I' || input[3] != '1' ||
+        read_u16(input + 4) != 1 || read_u16(input + 6) != 24 ||
+        read_u32(input + 12) != 0) {
+        return SQLITE_CORRUPT_VTAB;
+    }
+    count = read_u32(input + 8);
+    if (count > TSDB_MAX_QUERY_POINTS) return SQLITE_TOOBIG;
+    expected_size = 16 + (sqlite3_uint64)count * 24;
+    if (expected_size != (sqlite3_uint64)input_size) return SQLITE_CORRUPT_VTAB;
+    *record_count = count;
+    return SQLITE_OK;
+}
+
+static int cold_sample_exists(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 timestamp_ms,
+    int *exists) {
+    sqlite3_stmt *statement = NULL;
+    int rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT payload FROM \"%w\" "
+        "WHERE series_id=?1 AND min_ts<=?2 AND max_ts>=?2",
+        vtab->blocks_name);
+    *exists = 0;
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, timestamp_ms);
+    while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        TsdbCodecPoint *decoded = NULL;
+        uint32_t decoded_count = 0;
+        int codec = 0;
+        uint32_t index;
+        int codec_rc = tsdb_block_decode(
+            sqlite3_column_blob(statement, 0),
+            (size_t)sqlite3_column_bytes(statement, 0),
+            &decoded,
+            &decoded_count,
+            &codec);
+        (void)codec;
+        if (codec_rc != TSDB_CODEC_OK ||
+            decoded_count > (uint32_t)vtab->max_block_points) {
+            free(decoded);
+            rc = SQLITE_CORRUPT_VTAB;
+            break;
+        }
+        for (index = 0; index < decoded_count; ++index) {
+            if (decoded[index].timestamp_ms == timestamp_ms) {
+                *exists = 1;
+                break;
+            }
+        }
+        free(decoded);
+        if (*exists) break;
+    }
+    if (rc == SQLITE_DONE || (rc == SQLITE_ROW && *exists)) rc = SQLITE_OK;
+    sqlite3_finalize(statement);
+    return rc;
+}
+
+static int cold_max_timestamp(TsdbVtab *vtab, sqlite3_int64 *max_timestamp) {
+    sqlite3_stmt *statement = NULL;
+    int rc;
+    if (vtab->cold_max_known) {
+        *max_timestamp = vtab->cold_max_timestamp;
+        return SQLITE_OK;
+    }
+    rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT coalesce(max(max_ts),-1) FROM \"%w\"",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_ROW) {
+        *max_timestamp = sqlite3_column_int64(statement, 0);
+        vtab->cold_max_timestamp = *max_timestamp;
+        vtab->cold_max_known = 1;
+        rc = SQLITE_OK;
+    }
+    sqlite3_finalize(statement);
+    return rc;
+}
+
+static int ingest_batch(
+    TsdbVtab *vtab,
+    const unsigned char *input,
+    int input_size,
+    int overwrite_existing,
+    sqlite3_int64 *inserted_count) {
+    sqlite3_stmt *change_statement = NULL;
+    uint32_t record_count = 0;
+    uint32_t index;
+    sqlite3_int64 cold_max = -1;
+    int rc = validate_batch_blob(input, input_size, &record_count);
+    *inserted_count = 0;
+    if (rc != SQLITE_OK) return rc;
+    rc = cold_max_timestamp(vtab, &cold_max);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = exec_format(vtab->db, NULL, "DELETE FROM \"%w\"", vtab->changes_name);
+    if (rc != SQLITE_OK) return rc;
+    rc = prepare_format(
+        vtab->db,
+        &change_statement,
+        "INSERT INTO \"%w\"(ts,sample_count) VALUES(?1,1) "
+        "ON CONFLICT(ts) DO UPDATE SET sample_count=sample_count+1",
+        vtab->changes_name);
+    if (rc != SQLITE_OK) return rc;
+
+    for (index = 0; index < record_count; ++index) {
+        const unsigned char *record = input + 16 + (size_t)index * 24;
+        sqlite3_int64 series_id = bits_to_sql_int(read_u64(record));
+        sqlite3_int64 timestamp_ms = bits_to_sql_int(read_u64(record + 8));
+        double value = tsdb_bits_to_double(read_u64(record + 16));
+        int exists_cold = 0;
+        int inserted_head = 0;
+        if (series_id <= 0 || timestamp_ms < 0 ||
+            timestamp_ms > INT64_MAX - vtab->block_span_ms || isnan(value)) {
+            rc = SQLITE_CONSTRAINT;
+            break;
+        }
+        if (timestamp_ms <= cold_max) {
+            rc = cold_sample_exists(vtab, series_id, timestamp_ms, &exists_cold);
+            if (rc != SQLITE_OK) break;
+        }
+        if (!exists_cold || overwrite_existing) {
+            rc = insert_sample(
+                vtab,
+                series_id,
+                timestamp_ms,
+                value,
+                overwrite_existing,
+                &inserted_head);
+            if (rc != SQLITE_OK) break;
+        }
+        if (!exists_cold && inserted_head) {
+            sqlite3_bind_int64(change_statement, 1, timestamp_ms);
+            rc = sqlite3_step(change_statement);
+            sqlite3_reset(change_statement);
+            sqlite3_clear_bindings(change_statement);
+            if (rc != SQLITE_DONE) break;
+            ++*inserted_count;
+        }
+    }
+    sqlite3_finalize(change_statement);
     return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
@@ -1157,6 +1355,7 @@ static int tsdb_update(
     sqlite3_int64 *rowid) {
     TsdbVtab *vtab = (TsdbVtab *)base;
     int rc;
+    int inserted;
     if (argc == 1) {
         set_vtab_error(vtab, "individual DELETE is not supported; use delete-before");
         return SQLITE_READONLY;
@@ -1181,6 +1380,18 @@ static int tsdb_update(
         } else if (strcmp(control, "delete-before") == 0) {
             if (sqlite3_value_type(argv[6]) != SQLITE_INTEGER) return SQLITE_MISMATCH;
             rc = delete_before(vtab, sqlite3_value_int64(argv[6]));
+        } else if (strcmp(control, "ingest-batch") == 0) {
+            sqlite3_int64 inserted_count = 0;
+            if (sqlite3_value_type(argv[6]) != SQLITE_BLOB) return SQLITE_MISMATCH;
+            rc = ingest_batch(
+                vtab,
+                (const unsigned char *)sqlite3_value_blob(argv[6]),
+                sqlite3_value_bytes(argv[6]),
+                sqlite3_value_type(argv[7]) == SQLITE_INTEGER &&
+                    sqlite3_value_int(argv[7]) != 0,
+                &inserted_count);
+            *rowid = inserted_count;
+            return rc;
         } else {
             set_vtab_error(vtab, "unknown control command: %s", control);
             return SQLITE_ERROR;
@@ -1211,14 +1422,17 @@ static int tsdb_update(
         vtab,
         sqlite3_value_int64(argv[2]),
         sqlite3_value_int64(argv[3]),
-        sqlite3_value_double(argv[4]));
+        sqlite3_value_double(argv[4]),
+        1,
+        &inserted);
     *rowid = sqlite3_value_int64(argv[3]);
     return rc;
 }
 
 static int tsdb_shadow_name(const char *suffix) {
     return sqlite3_stricmp(suffix, "head") == 0 ||
-           sqlite3_stricmp(suffix, "blocks") == 0;
+           sqlite3_stricmp(suffix, "blocks") == 0 ||
+           sqlite3_stricmp(suffix, "changes") == 0;
 }
 
 static int batch_connect(
@@ -1299,7 +1513,7 @@ static int batch_filter(
     const unsigned char *input;
     int input_size;
     uint32_t count;
-    sqlite3_uint64 expected_size;
+    int rc;
     (void)plan_string;
     sqlite3_free(cursor->data);
     cursor->data = NULL;
@@ -1310,16 +1524,8 @@ static int batch_filter(
     }
     input = (const unsigned char *)sqlite3_value_blob(argv[0]);
     input_size = sqlite3_value_bytes(argv[0]);
-    if (!input || input_size < 16 ||
-        input[0] != 'T' || input[1] != 'S' || input[2] != 'I' || input[3] != '1' ||
-        read_u16(input + 4) != 1 || read_u16(input + 6) != 24 ||
-        read_u32(input + 12) != 0) {
-        return SQLITE_CORRUPT_VTAB;
-    }
-    count = read_u32(input + 8);
-    if (count > TSDB_MAX_QUERY_POINTS) return SQLITE_TOOBIG;
-    expected_size = 16 + (sqlite3_uint64)count * 24;
-    if (expected_size != (sqlite3_uint64)input_size) return SQLITE_CORRUPT_VTAB;
+    rc = validate_batch_blob(input, input_size, &count);
+    if (rc != SQLITE_OK) return rc;
     cursor->data = (unsigned char *)sqlite3_malloc64((sqlite3_uint64)input_size);
     if (!cursor->data) return SQLITE_NOMEM;
     memcpy(cursor->data, input, (size_t)input_size);

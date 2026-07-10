@@ -32,6 +32,10 @@ vpath %.c $(SQLITE_TSDB_DIR)/adapters/wa-sqlite
 
 include Makefile
 
+TSDB_OPT_LEVEL ?= -Oz
+override CFLAGS_DIST := $(filter-out -O%,$(CFLAGS_DIST)) $(TSDB_OPT_LEVEL)
+override EMFLAGS_DIST := $(filter-out -O%,$(EMFLAGS_DIST)) $(TSDB_OPT_LEVEL)
+
 tmp/bc/debug/sqlite_tsdb.bc: sqlite_tsdb.c
 	mkdir -p tmp/bc/debug
 	$(EMCC) $(CFLAGS_DEBUG) $(WASQLITE_DEFINES) $< -c -o $@

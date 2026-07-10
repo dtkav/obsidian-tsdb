@@ -1,5 +1,5 @@
 {
-  "runtime": { "node": "v24.17.0", "wasmBytes": 1133534 },
+  "runtime": { "node": "v24.17.0", "wasmBytes": 554976, "optimization": "-Oz" },
   "workload": {
     "seriesCount": 50,
     "pointsPerSeries": 720,
@@ -7,26 +7,26 @@
     "stepMs": 30000
   },
   "baseline": {
-    "ingestMs": 1318.252199,
-    "queryMs": 24.90150399999993,
-    "retentionMs": 131.72439999999983,
+    "ingestMs": 448.46111199999996,
+    "queryMs": 13.440224000000057,
+    "retentionMs": 37.573132999999984,
     "selectedRows": 3600,
     "sizeBytes": 1466368
   },
   "tsdb": {
-    "ingestMs": 697.0144480000001,
-    "compactMs": 561.604241,
-    "queryMs": 49.820516000000225,
-    "packedQueryMs": 15.701097000000118,
-    "retentionMs": 59.855287999999746,
+    "ingestMs": 415.657696,
+    "compactMs": 150.45383300000015,
+    "queryMs": 17.155031000000008,
+    "packedQueryMs": 8.179452000000083,
+    "retentionMs": 26.407541000000037,
     "selectedRows": 3600,
     "packedSeries": 10,
-    "sizeBytes": 1495040
+    "sizeBytes": 1499136
   },
   "ratios": {
-    "ingest": 0.5287413505008689,
-    "query": 2.0007030900623657,
-    "retention": 0.4543978792084065,
-    "size": 1.0195530726256983
+    "ingest": 0.9268533767538801,
+    "query": 1.2763947237784083,
+    "retention": 0.7028304240692425,
+    "size": 1.0223463687150838
   }
 }

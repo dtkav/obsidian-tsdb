@@ -8,7 +8,7 @@ const HEADER_BYTES = 16;
 const RECORD_BYTES = 24;
 const MAX_RECORDS = 1_048_576;
 
-/** Encode the versioned fixed-width input consumed by tsdb_batch(?). */
+/** Encode the versioned fixed-width input consumed by TSDB batch APIs. */
 export function encodeTsdbBatch(rows: TsdbBatchRow[]): Uint8Array {
 	if (rows.length > MAX_RECORDS) {
 		throw new Error(`tsdb: batch exceeds ${MAX_RECORDS} records`);

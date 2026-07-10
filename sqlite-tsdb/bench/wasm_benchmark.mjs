@@ -149,7 +149,7 @@ async function benchmarkTsdb() {
 	);
 	const insert = await prepare(
 		db,
-		"INSERT INTO samples(series_id,ts,value) SELECT series_id,ts,value FROM tsdb_batch(?1)"
+		"INSERT INTO samples(control,arg1,arg2) VALUES('ingest-batch',?1,1)"
 	);
 	const started = performance.now();
 	for (let pointIndex = 0; pointIndex < pointsPerSeries; pointIndex++) {

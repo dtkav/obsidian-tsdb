@@ -24,11 +24,12 @@ Implemented:
 - Block-level retention with boundary-block rewriting.
 - CRC validation over block headers and payloads.
 - Fixed-width packed batch input through `tsdb_batch(?)`.
+- Direct packed batch ingestion with exact new-sample accounting.
 - Packed per-series query output through `tsdb_pack(ts, value)`.
 
 Not implemented yet:
 
-- Published Wasm artifacts and TypeScript bindings for packed transport.
+- Published, versioned Wasm artifacts.
 - Exact constant-time global/per-series statistics.
 - Individual SQL `UPDATE` or `DELETE` operations.
 - Stable on-disk compatibility guarantees.
@@ -78,6 +79,19 @@ INSERT INTO samples(series_id, ts, value)
 SELECT series_id, ts, value FROM tsdb_batch(?);
 ```
 
+For the lowest boundary overhead, ingest the BLOB directly. `arg2=1`
+overwrites existing samples, while `arg2=0` leaves them unchanged:
+
+```sql
+BEGIN;
+INSERT INTO samples(control, arg1, arg2)
+VALUES ('ingest-batch', ?, 1);
+
+-- Exact timestamps added by this batch, replaced by the next batch call.
+SELECT ts, sample_count FROM samples_changes;
+COMMIT;
+```
+
 They can return one compressed BLOB per series instead of one SQL row per
 sample:
 
@@ -109,11 +123,13 @@ rejected; infinities and negative zero are preserved.
 
 ## Design
 
-Each virtual table owns two SQLite shadow tables:
+Each virtual table owns three SQLite shadow tables:
 
 - `<name>_head`: mutable rows with a composite primary key.
 - `<name>_blocks`: immutable compressed chunks grouped by series and fixed time
   bucket.
+- `<name>_changes`: transient per-timestamp counts for the most recent direct
+  batch ingest.
 
 Open buckets stay in the head table. Compaction only seals complete buckets,
 avoiding repeated decompression and recompression during normal ingestion.
