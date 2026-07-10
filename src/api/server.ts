@@ -3,6 +3,7 @@ import { PromQLEngine } from "../promql/engine";
 import { parseSeriesSelector } from "../promql/parser";
 import { MetricsStore } from "../storage/store";
 import { Matcher } from "../labels";
+import type { ApiHealthStatus } from "../health";
 import type {
 	ErrnoError,
 	HttpModule,
@@ -29,6 +30,8 @@ export interface ApiServerDeps {
 	pluginVersion: string;
 }
 
+export type { ApiHealthStatus } from "../health";
+
 /** Parse a Prometheus API time param: unix seconds (float) or RFC 3339. */
 export function parseTimeParam(raw: string): number {
 	if (/^-?\d+(\.\d+)?$/.test(raw)) {
@@ -52,17 +55,6 @@ export function parseStepParam(raw: string): number {
 interface ApiRequest {
 	params: URLSearchParams;
 	pathname: string;
-}
-
-export interface ApiHealthStatus {
-	ok: boolean;
-	storeOpen: boolean;
-	queryEngineReady: boolean;
-	lastIngestMs: number | null;
-	lastIngestSampleCount: number;
-	lastIngestError: string | null;
-	lastIngestErrorMs: number | null;
-	inFlightIngests: number;
 }
 
 /**

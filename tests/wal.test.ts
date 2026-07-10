@@ -173,4 +173,31 @@ describe("SampleWal", () => {
 		});
 		expect(adapter.files.get("metrics.wal")).toBe("");
 	});
+
+	it("keeps a recovery WAL when startup replay is cancelled", async () => {
+		const adapter = makeAdapter();
+		const wal = new SampleWal(adapter, "metrics.wal");
+		wal.append([sample("a", 1000, 1)]);
+		wal.append([sample("b", 2000, 2)]);
+		await wal.barrier();
+		const before = adapter.files.get("metrics.wal");
+		let keepGoing = true;
+		const store = {
+			recoveredFromCorruption: true,
+			ingested: [] as StoredSample[],
+			ingest(samples: StoredSample[]) {
+				this.ingested.push(...samples);
+				keepGoing = false;
+			},
+		} as MetricsStore & { ingested: StoredSample[] };
+
+		const result = await maintainStartupWal(wal, store, {
+			shouldContinue: () => keepGoing,
+		});
+
+		expect(result.aborted).toBe(true);
+		expect(result.samples).toBe(1);
+		expect(store.ingested.map((s) => s.labels.__name__)).toEqual(["a"]);
+		expect(adapter.files.get("metrics.wal")).toBe(before);
+	});
 });

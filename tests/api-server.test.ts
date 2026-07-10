@@ -9,6 +9,41 @@ import {
 
 const HEALTHY: ApiHealthStatus = {
 	ok: true,
+	store: {
+		open: true,
+	},
+	queryEngine: {
+		ready: true,
+	},
+	api: {
+		running: true,
+		port: 19841,
+	},
+	ingest: {
+		lastSuccessMs: null,
+		lastSampleCount: 0,
+		lastError: null,
+		lastErrorMs: null,
+		inFlight: 0,
+	},
+	scraper: {
+		running: true,
+		targets: 0,
+		up: 0,
+		down: 0,
+		pending: 0,
+		stale: 0,
+		lastScrapeMs: null,
+		lastError: null,
+		lastErrorMs: null,
+	},
+	wal: {
+		startup: "idle",
+		lastCheckpointError: null,
+		lastCheckpointErrorMs: null,
+		lastReplayError: null,
+		lastReplayErrorMs: null,
+	},
 	storeOpen: true,
 	queryEngineReady: true,
 	lastIngestMs: null,
@@ -109,7 +144,11 @@ describe("ApiServer health", () => {
 			expect(response.statusCode).toBe(200);
 			expect(response.body.status).toBe("ok");
 			expect(response.body.storeOpen).toBe(true);
+			expect(response.body.store.open).toBe(true);
 			expect(response.body.lastIngestError).toBe(null);
+			expect(response.body.ingest.lastError).toBe(null);
+			expect(response.body.scraper.down).toBe(0);
+			expect(response.body.wal.startup).toBe("idle");
 		} finally {
 			await api.close();
 		}
@@ -119,6 +158,11 @@ describe("ApiServer health", () => {
 		const api = makeServer({
 			...HEALTHY,
 			ok: false,
+			ingest: {
+				...HEALTHY.ingest,
+				lastError: "Error: database disk image is malformed",
+				lastErrorMs: 1783657633000,
+			},
 			lastIngestError: "Error: database disk image is malformed",
 			lastIngestErrorMs: 1783657633000,
 		});
@@ -128,6 +172,7 @@ describe("ApiServer health", () => {
 			expect(response.statusCode).toBe(503);
 			expect(response.body.status).toBe("error");
 			expect(response.body.lastIngestError).toContain("malformed");
+			expect(response.body.ingest.lastError).toContain("malformed");
 		} finally {
 			await api.close();
 		}

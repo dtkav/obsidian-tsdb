@@ -415,16 +415,21 @@ export class MetricsSettingTab extends PluginSettingTab {
 		const latest = statuses
 			.filter((status) => status.lastScrapeMs !== null)
 			.sort((a, b) => (b.lastScrapeMs ?? 0) - (a.lastScrapeMs ?? 0))[0];
-		const upCount = statuses.filter((status) => status.up).length;
+		const upCount = statuses.filter((status) => status.up === true).length;
+		const pendingCount = statuses.filter(
+			(status) => status.lastScrapeMs === null
+		).length;
 		const healthText =
 			statuses.length === 1
-				? upCount === 1
+				? statuses[0].up === true
 					? "Endpoint up"
+					: statuses[0].up === false
+					? "Endpoint down"
 					: "Endpoint down"
 				: `${upCount}/${statuses.length} endpoints up`;
 		const statusText = !job.enabled
 			? "Paused"
-			: statuses.length === 0
+			: statuses.length === 0 || pendingCount === statuses.length
 			? "Waiting for first scrape"
 			: latest?.lastScrapeMs
 			? `${healthText} · Last scrape ${this.relativeTime(latest.lastScrapeMs)}`

@@ -202,9 +202,11 @@ function syntheticSamples(
 export interface ScraperStatus {
 	job: string;
 	target: string;
+	kind: "self" | "target";
+	intervalSeconds: number;
 	lastScrapeMs: number | null;
 	lastError: string | null;
-	up: boolean;
+	up: boolean | null;
 }
 
 export type ScrapeStatusChangeListener = () => void;
@@ -254,25 +256,46 @@ export class Scraper {
 		this.onTargetStatusChange?.();
 
 		for (const source of selfSources) {
+			const intervalSeconds = Math.max(1, source.intervalSeconds);
+			this.setStatus(
+				`${source.jobName}//self`,
+				source.jobName,
+				"self",
+				null,
+				null,
+				false,
+				"self",
+				intervalSeconds
+			);
 			const run = () => void this.scrapeSelf(source, instance, generation);
 			run();
-			this.timers.push(
-				window.setInterval(run, Math.max(1, source.intervalSeconds) * 1000)
-			);
+			this.timers.push(window.setInterval(run, intervalSeconds * 1000));
 		}
 
 		for (const job of jobs) {
 			if (!job.enabled || job.targets.length === 0) continue;
+			const intervalSeconds = Math.max(5, job.intervalSeconds);
+			for (const target of job.targets) {
+				this.setStatus(
+					`${job.jobName}//${target}`,
+					job.jobName,
+					target,
+					null,
+					null,
+					false,
+					"target",
+					intervalSeconds
+				);
+			}
 			const run = () => {
 				for (const target of job.targets) {
 					void this.scrapeTarget(job, target, generation);
 				}
 			};
 			run();
-			this.timers.push(
-				window.setInterval(run, Math.max(5, job.intervalSeconds) * 1000)
-			);
+			this.timers.push(window.setInterval(run, intervalSeconds * 1000));
 		}
+		this.onTargetStatusChange?.();
 	}
 
 	stop(): void {
@@ -303,6 +326,7 @@ export class Scraper {
 		if (this.inFlight.get(key) === generation) return;
 		this.inFlight.set(key, generation);
 		const started = Date.now();
+		const intervalSeconds = Math.max(1, source.intervalSeconds);
 		try {
 			const samples =
 				source.collect !== undefined
@@ -341,7 +365,16 @@ export class Scraper {
 				durationSeconds: duration,
 				samplesScraped: samples.length - 3,
 			});
-			this.setStatus(key, source.jobName, "self", started, null);
+			this.setStatus(
+				key,
+				source.jobName,
+				"self",
+				started,
+				null,
+				false,
+				"self",
+				intervalSeconds
+			);
 		} catch (error) {
 			if (generation !== this.generation) return;
 			await this.recordFailure(source.jobName, instance, started);
@@ -354,7 +387,16 @@ export class Scraper {
 				durationSeconds: (Date.now() - started) / 1000,
 				samplesScraped: 0,
 			});
-			this.setStatus(key, source.jobName, "self", started, String(error));
+			this.setStatus(
+				key,
+				source.jobName,
+				"self",
+				started,
+				String(error),
+				false,
+				"self",
+				intervalSeconds
+			);
 		} finally {
 			if (this.inFlight.get(key) === generation) this.inFlight.delete(key);
 		}
@@ -370,6 +412,7 @@ export class Scraper {
 		this.inFlight.set(key, generation);
 		const instance = instanceFromTarget(target);
 		const started = Date.now();
+		const intervalSeconds = Math.max(5, job.intervalSeconds);
 		try {
 			const text = await fetchText(
 				target,
@@ -389,7 +432,6 @@ export class Scraper {
 				)
 			);
 			if (generation !== this.generation) return;
-			this.setStatus(key, job.jobName, target, started, null, true);
 			await this.sink.ingest(samples);
 			if (generation !== this.generation) return;
 			this.observeScrape({
@@ -400,9 +442,28 @@ export class Scraper {
 				durationSeconds: duration,
 				samplesScraped: samples.length - 3,
 			});
+			this.setStatus(
+				key,
+				job.jobName,
+				target,
+				started,
+				null,
+				true,
+				"target",
+				intervalSeconds
+			);
 		} catch (error) {
 			if (generation !== this.generation) return;
-			this.setStatus(key, job.jobName, target, started, String(error), true);
+			this.setStatus(
+				key,
+				job.jobName,
+				target,
+				started,
+				String(error),
+				true,
+				"target",
+				intervalSeconds
+			);
 			await this.recordFailure(job.jobName, instance, started);
 			this.observeScrape({
 				source: job.jobName,
@@ -442,16 +503,20 @@ export class Scraper {
 		key: string,
 		job: string,
 		target: string,
-		lastScrapeMs: number,
+		lastScrapeMs: number | null,
 		lastError: string | null,
-		notify = false
+		notify = false,
+		kind: "self" | "target",
+		intervalSeconds: number
 	): void {
 		this.statuses.set(key, {
 			job,
 			target,
+			kind,
+			intervalSeconds,
 			lastScrapeMs,
 			lastError,
-			up: lastError === null,
+			up: lastScrapeMs === null ? null : lastError === null,
 		});
 		if (notify) this.onTargetStatusChange?.();
 	}

@@ -17,6 +17,7 @@ import { setupTsdbMetrics } from "./exporter/tsdb-metrics";
 import type { TsdbMetricsRecorder } from "./exporter/tsdb-metrics";
 import { PromQLEngine } from "./promql/engine";
 import { Scraper, ScraperStatus } from "./scrape/scraper";
+import { summarizeScraperHealth, WalHealthStatus } from "./health";
 import {
 	DEFAULT_SETTINGS,
 	ObsidianMetricsSettings,
@@ -106,6 +107,13 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		lastIngestSampleCount: 0,
 		lastIngestError: null,
 		lastIngestErrorMs: null,
+	};
+	private walHealth: WalHealthStatus = {
+		startup: "idle",
+		lastCheckpointError: null,
+		lastCheckpointErrorMs: null,
+		lastReplayError: null,
+		lastReplayErrorMs: null,
 	};
 	public isUnloading = false;
 
@@ -474,6 +482,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		await this.stopMetricsServer(true);
 		this.apiServer?.dispose();
 		this.walReplayCancelled = true;
+		await this.waitForWalStartupMaintenance();
 		await this.waitForInFlightIngests();
 		await this.flushStore();
 		await this.store?.close().catch((error) => {
@@ -761,6 +770,16 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		}
 	}
 
+	private async waitForWalStartupMaintenance(): Promise<void> {
+		const startup = this.walStartupPromise;
+		if (!startup) return;
+		try {
+			await startup;
+		} catch (error) {
+			console.warn("tsdb: WAL startup maintenance failed during teardown", error);
+		}
+	}
+
 	/**
 	 * Checkpoint the WAL: every entry predates a committed transaction, so
 	 * it can be truncated whenever no appends are in flight.
@@ -779,8 +798,12 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			if (this.wal.epoch === epoch) {
 				await this.wal.truncate();
 			}
+			this.walHealth.lastCheckpointError = null;
+			this.walHealth.lastCheckpointErrorMs = null;
 		} catch (error) {
 			status = "error";
+			this.walHealth.lastCheckpointError = String(error);
+			this.walHealth.lastCheckpointErrorMs = Date.now();
 			console.error("tsdb: WAL checkpoint failed", error);
 		} finally {
 			this.tsdbMetrics?.recordWalCheckpoint(
@@ -796,6 +819,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		const store = this.store;
 		const started = performance.now();
 		this.walReplayCancelled = false;
+		this.walHealth.startup = "running";
 		const recovery = maintainStartupWal(wal, store, {
 			shouldContinue: () =>
 				!this.walReplayCancelled &&
@@ -807,6 +831,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				const durationSeconds = (performance.now() - started) / 1000;
 				if (result.mode === "checkpoint") {
 					this.tsdbMetrics?.recordWalCheckpoint(durationSeconds, "ok");
+					this.walHealth.lastCheckpointError = null;
+					this.walHealth.lastCheckpointErrorMs = null;
 					return;
 				}
 				if (result.aborted) {
@@ -834,6 +860,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 					durationSeconds,
 					"ok"
 				);
+				this.walHealth.lastReplayError = null;
+				this.walHealth.lastReplayErrorMs = null;
 			})
 			.catch((error) => {
 				const durationSeconds = (performance.now() - started) / 1000;
@@ -845,15 +873,22 @@ export default class ObsidianMetricsPlugin extends Plugin {
 						durationSeconds,
 						"error"
 					);
+					this.walHealth.lastReplayError = String(error);
+					this.walHealth.lastReplayErrorMs = Date.now();
 					console.error("tsdb: WAL replay failed", error);
 					return;
 				}
 				this.tsdbMetrics?.recordWalCheckpoint(durationSeconds, "error");
+				this.walHealth.lastCheckpointError = String(error);
+				this.walHealth.lastCheckpointErrorMs = Date.now();
 				console.error("tsdb: WAL startup checkpoint failed", error);
 			});
 		const tracked = recovery.finally(() => {
 			if (this.walStartupPromise === tracked) {
 				this.walStartupPromise = null;
+			}
+			if (this.walHealth.startup === "running") {
+				this.walHealth.startup = "idle";
 			}
 		});
 		this.walStartupPromise = tracked;
@@ -871,13 +906,41 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.updateTsdbHealthMetrics();
 		const storeOpen = this.store?.isOpen ?? false;
 		const queryEngineReady = this.engine !== null;
+		const scraper = summarizeScraperHealth(
+			this.getScrapeStatuses(),
+			this.scraper !== null
+		);
+		const ingest = {
+			lastSuccessMs: this.storeHealth.lastIngestMs,
+			lastSampleCount: this.storeHealth.lastIngestSampleCount,
+			lastError: this.storeHealth.lastIngestError,
+			lastErrorMs: this.storeHealth.lastIngestErrorMs,
+			inFlight: this.inFlightIngests.size,
+		};
 		const ok =
 			!this.isUnloading &&
 			storeOpen &&
 			queryEngineReady &&
-			this.storeHealth.lastIngestError === null;
+			ingest.lastError === null &&
+			scraper.down === 0 &&
+			scraper.stale === 0 &&
+			this.walHealth.lastCheckpointError === null &&
+			this.walHealth.lastReplayError === null;
 		return {
 			ok,
+			store: {
+				open: storeOpen,
+			},
+			queryEngine: {
+				ready: queryEngineReady,
+			},
+			api: {
+				running: this.apiServer?.listening ?? false,
+				port: this.boundPort,
+			},
+			ingest,
+			scraper,
+			wal: { ...this.walHealth },
 			storeOpen,
 			queryEngineReady,
 			lastIngestMs: this.storeHealth.lastIngestMs,
