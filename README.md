@@ -1,9 +1,9 @@
 # TSDB
 
 TSDB is a local time-series database for Obsidian. It records metrics from this
-vault and from other plugins, stores them in a durable SQLite database inside
-the vault's plugin folder, and lets notes render live charts with PromQL code
-blocks.
+vault and from other plugins, stores them in a durable SQLite database backed
+by Obsidian's browser storage, and lets notes render live charts with PromQL
+code blocks.
 
 The default path is local and offline: collect metrics, keep history, query the
 local database, and chart the results in Obsidian. Prometheus HTTP serving and
@@ -12,8 +12,8 @@ external endpoint scraping are available under advanced settings.
 ## What it does
 
 - **Local time-series database**: stores samples in SQLite through `wa-sqlite`.
-  Desktop vaults use a normal `metrics.sqlite` file; mobile and non-filesystem
-  adapters fall back to vault-adapter chunk files without native modules.
+  The default engine runs in a worker and keeps the database in OPFS, so there
+  is no normal `metrics.sqlite` file in the plugin directory.
 - **Plugin metric registration**: other plugins register named metric stores
   with `app.plugins.plugins["tsdb"].api.getStore(...)` or the `tsdb:ready`
   workspace event.
@@ -51,13 +51,14 @@ external endpoint scraping are available under advanced settings.
 
 ## Time-Series Database
 
-TSDB records metric samples into a SQLite database stored under the plugin
-folder. On desktop, the database lives in `metrics.sqlite` with SQLite's
-journal file beside it. On mobile or any adapter without direct filesystem
-access, TSDB uses `metrics-tsdb/` as 64 KiB chunk files. Both backends use the
-same SQLite schema and `metrics.wal` recovery log. Each scrape batch is
-committed as a SQLite transaction, and retention pruning removes old samples on
-a schedule.
+TSDB records metric samples into a SQLite database using `wa-sqlite`. By
+default, the database is opened in a worker and stored in OPFS (Origin Private
+File System), the browser-managed storage area available to Obsidian's
+renderer. This means the active database is not a normal vault file and does
+not appear as `metrics.sqlite` under `.obsidian/plugins/tsdb/`.
+
+Each scrape batch is committed as a SQLite transaction, and retention pruning
+removes old samples on a schedule.
 
 The local database is the center of the plugin:
 
@@ -277,11 +278,11 @@ Key settings:
 
 - **Metric stores**: enable or disable each local store and set its recording
   interval.
-- **Database**: set retention and recovery log checkpoint interval.
+- **Database**: set retention and view the active OPFS database status.
 - **HTTP API**: enable the local Prometheus-compatible server and set the port
   or port range.
 - **Scraping**: add external Prometheus exposition targets.
-- **Advanced**: set the metric prefix and clear the committed recovery log.
+- **Advanced**: set the metric prefix.
 
 The HTTP server is disabled by default. Local recording and note charting do
 not require it.
@@ -357,7 +358,7 @@ tsdb/
 |   +-- types.ts             # Public metric API types
 |   +-- exporter/            # prom-client registry, public API, built-ins
 |   +-- scrape/              # Exposition parser and scrape scheduler
-|   +-- storage/             # wa-sqlite TSDB, Node/chunk VFS, recovery WAL
+|   +-- storage/             # wa-sqlite TSDB, OPFS worker, recovery WAL
 |   +-- promql/              # PromQL AST, parser, and engine
 |   +-- panels/              # Markdown panel config and rendering data
 |   +-- api/                 # HTTP server and /api/v1 routes
