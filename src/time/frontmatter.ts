@@ -9,8 +9,11 @@ export function parseTimeOverrides(frontmatter: unknown): TimeOverrides | null {
 	const root = frontmatter as Record<string, unknown>;
 	const tsdb = root.tsdb;
 	if (!tsdb || typeof tsdb !== "object") return null;
-	const time = (tsdb as Record<string, unknown>).time;
-	if (!time || typeof time !== "object") return null;
+	const tsdbData = tsdb as Record<string, unknown>;
+	const time =
+		tsdbData.time && typeof tsdbData.time === "object"
+			? tsdbData.time
+			: tsdbData;
 	const data = time as Record<string, unknown>;
 
 	const overrides: TimeOverrides = {};

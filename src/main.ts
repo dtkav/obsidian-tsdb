@@ -1106,6 +1106,18 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		};
 	}
 
+	getFrontmatter(sourcePath: string): unknown {
+		return this.app.metadataCache.getCache(sourcePath)?.frontmatter;
+	}
+
+	onFrontmatterChanged(sourcePath: string, listener: () => void): () => void {
+		const ref = this.app.metadataCache.on("changed", (file) => {
+			const changedPath = (file as { path?: unknown } | undefined)?.path;
+			if (changedPath === sourcePath) listener();
+		});
+		return () => this.app.metadataCache.offref(ref);
+	}
+
 	private updateTsdbHealthMetrics(): void {
 		this.tsdbMetrics?.setHealth({
 			storeOpen: this.store?.isOpen ?? false,

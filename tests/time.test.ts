@@ -78,6 +78,19 @@ describe("global time context resolution", () => {
 });
 
 describe("time frontmatter", () => {
+	it("parses direct tsdb start/end/step overrides", () => {
+		const overrides = parseTimeOverrides({
+			tsdb: {
+				start: "2026-07-08T09:00:00-07:00",
+				end: "2026-07-08T12:00:00-07:00",
+				step: "30s",
+			},
+		});
+		expect(overrides?.startMs).toBe(Date.parse("2026-07-08T09:00:00-07:00"));
+		expect(overrides?.endMs).toBe(Date.parse("2026-07-08T12:00:00-07:00"));
+		expect(overrides?.stepMs).toBe(30_000);
+	});
+
 	it("parses nested tsdb time overrides", () => {
 		const overrides = parseTimeOverrides({
 			tsdb: {

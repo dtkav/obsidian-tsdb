@@ -42,6 +42,11 @@ export interface PanelHost {
 	timeContext: TimeContext;
 	isUnloading?: boolean;
 	getHealthStatus?: () => ApiHealthStatus;
+	getFrontmatter?: (sourcePath: string) => unknown;
+	onFrontmatterChanged?: (
+		sourcePath: string,
+		listener: () => void
+	) => () => void;
 }
 
 /**
@@ -54,7 +59,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	private host: PanelHost;
 	private source: string;
 	private sourcePath: string;
-	private frontmatter: unknown;
+	private initialFrontmatter: unknown;
 	private config: PanelConfig | null = null;
 	private plot: uPlot | null = null;
 	private resizeObserver: ResizeObserver | null = null;
@@ -72,7 +77,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		this.host = host;
 		this.source = source;
 		this.sourcePath = sourcePath;
-		this.frontmatter = frontmatter;
+		this.initialFrontmatter = frontmatter;
 	}
 
 	onload(): void {
@@ -99,6 +104,11 @@ export class PromQLPanel extends MarkdownRenderChild {
 
 		void this.refresh();
 		this.register(this.host.timeContext.subscribe(() => void this.refresh()));
+		const unsubscribeFrontmatter = this.host.onFrontmatterChanged?.(
+			this.sourcePath,
+			() => void this.refresh()
+		);
+		if (unsubscribeFrontmatter) this.register(unsubscribeFrontmatter);
 		if (this.config.refreshSeconds !== null) {
 			this.registerInterval(
 				window.setInterval(
@@ -190,7 +200,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	): Promise<void> {
 		const resolved = this.host.timeContext.resolve(
 			config,
-			parseTimeOverrides(this.frontmatter)
+			parseTimeOverrides(this.currentFrontmatter())
 		);
 
 		const aligned: {
@@ -305,7 +315,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	): Promise<void> {
 		const resolved = this.host.timeContext.resolve(
 			config,
-			parseTimeOverrides(this.frontmatter)
+			parseTimeOverrides(this.currentFrontmatter())
 		);
 		const results: ApiResultData[] = await Promise.all(
 			config.queries.map((q) =>
@@ -383,5 +393,12 @@ export class PromQLPanel extends MarkdownRenderChild {
 		if (rows === 0) {
 			this.renderNoData(body);
 		}
+	}
+
+	private currentFrontmatter(): unknown {
+		if (this.host.getFrontmatter) {
+			return this.host.getFrontmatter(this.sourcePath);
+		}
+		return this.initialFrontmatter;
 	}
 }
