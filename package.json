@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-tsdb-plugin",
-	"version": "1.0.8",
+	"version": "1.0.9",
 	"description": "Local time series database for plugin metrics, embedded PromQL charts, Prometheus scraping, and Prometheus-compatible queries",
 	"main": "main.js",
 	"scripts": {
