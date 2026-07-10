@@ -12,6 +12,13 @@ import {
 import { TimeContext } from "../time/context";
 import { parseTimeOverrides } from "../time/frontmatter";
 import { expandTimeMacros } from "../time/query-vars";
+import type { ApiHealthStatus } from "../health";
+import {
+	PanelStatusMessage,
+	panelNoDataStatus,
+	panelQueryErrorStatus,
+	panelUnavailableStatus,
+} from "./status";
 
 // Validated categorical palettes (CVD-safe slot ordering; the dark column is
 // the same hues re-stepped for dark surfaces, not a separate palette).
@@ -34,6 +41,7 @@ export interface PanelHost {
 	engine: PromQLEngine | null;
 	timeContext: TimeContext;
 	isUnloading?: boolean;
+	getHealthStatus?: () => ApiHealthStatus;
 }
 
 /**
@@ -73,7 +81,11 @@ export class PromQLPanel extends MarkdownRenderChild {
 		try {
 			this.config = parsePanelConfig(this.source, parseYaml);
 		} catch (error) {
-			this.renderError(error instanceof Error ? error.message : String(error));
+			this.renderRootStatus({
+				tone: "error",
+				title: "Panel config error",
+				detail: error instanceof Error ? error.message : String(error),
+			});
 			return;
 		}
 
@@ -105,24 +117,43 @@ export class PromQLPanel extends MarkdownRenderChild {
 		this.resizeObserver = null;
 	}
 
-	private renderError(message: string): void {
-		if (this.unloaded) return;
-		this.containerEl.empty();
-		this.containerEl.createDiv({
-			cls: "omx-panel-error",
-			text: `promql panel: ${message}`,
-		});
+	private healthStatus(): ApiHealthStatus | null {
+		try {
+			return this.host.getHealthStatus?.() ?? null;
+		} catch {
+			return null;
+		}
 	}
 
-	private renderUnavailable(message: string): void {
+	private renderRootStatus(status: PanelStatusMessage): void {
+		if (this.unloaded) return;
+		this.containerEl.empty();
+		this.createStatus(this.containerEl, status);
+	}
+
+	private renderUnavailable(status: PanelStatusMessage): void {
 		if (this.unloaded || !this.bodyEl) return;
 		this.plot?.destroy();
 		this.plot = null;
 		this.bodyEl.empty();
-		this.bodyEl.createDiv({
-			cls: "omx-panel-empty",
-			text: message,
+		this.createStatus(this.bodyEl, status);
+	}
+
+	private renderNoData(body: HTMLElement): void {
+		this.plot?.destroy();
+		this.plot = null;
+		body.empty();
+		this.createStatus(body, panelNoDataStatus(this.healthStatus()));
+	}
+
+	private createStatus(parent: HTMLElement, status: PanelStatusMessage): void {
+		const el = parent.createDiv({
+			cls: `omx-panel-state is-${status.tone}`,
 		});
+		el.createDiv({ cls: "omx-panel-state-title", text: status.title });
+		if (status.detail) {
+			el.createDiv({ cls: "omx-panel-state-detail", text: status.detail });
+		}
 	}
 
 	private async refresh(): Promise<void> {
@@ -133,7 +164,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		const engine = this.host.engine;
 		if (!engine) {
 			if (this.host.isUnloading) return;
-			this.renderUnavailable("metrics database is starting");
+			this.renderUnavailable(panelUnavailableStatus(this.healthStatus()));
 			return;
 		}
 
@@ -146,10 +177,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		} catch (error) {
 			if (this.unloaded || this.host.isUnloading) return;
 			body.empty();
-			body.createDiv({
-				cls: "omx-panel-error",
-				text: `query error: ${error instanceof Error ? error.message : String(error)}`,
-			});
+			this.createStatus(body, panelQueryErrorStatus(error));
 		}
 	}
 
@@ -194,10 +222,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 		const legends = buildPanelLegends(aligned);
 
 		if (aligned.length === 0) {
-			this.plot?.destroy();
-			this.plot = null;
-			body.empty();
-			body.createDiv({ cls: "omx-panel-empty", text: "no data" });
+			this.renderNoData(body);
 			return;
 		}
 
@@ -311,7 +336,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 				}
 			}
 			if (entries.length === 0) {
-				body.createDiv({ cls: "omx-panel-empty", text: "no data" });
+				this.renderNoData(body);
 				return;
 			}
 			// The title names a lone stat; labels only disambiguate multiples.
@@ -356,8 +381,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 			}
 		}
 		if (rows === 0) {
-			body.empty();
-			body.createDiv({ cls: "omx-panel-empty", text: "no data" });
+			this.renderNoData(body);
 		}
 	}
 }

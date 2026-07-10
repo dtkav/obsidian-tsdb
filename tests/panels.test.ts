@@ -12,7 +12,13 @@ import {
 	formatStatValue,
 	formatUnitValue,
 } from "../src/panels/data";
+import {
+	panelNoDataStatus,
+	panelQueryErrorStatus,
+	panelUnavailableStatus,
+} from "../src/panels/status";
 import { ApiResultData } from "../src/promql/engine";
+import type { ApiHealthStatus } from "../src/health";
 
 // Stand-in for Obsidian's parseYaml, good enough for the shapes we test.
 const fakeYaml = (text: string): unknown => {
@@ -27,6 +33,45 @@ const fakeYaml = (text: string): unknown => {
 		obj[key] = /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : value;
 	}
 	return obj;
+};
+
+const HEALTHY: ApiHealthStatus = {
+	ok: true,
+	store: { open: true },
+	queryEngine: { ready: true },
+	api: { running: false, port: null },
+	ingest: {
+		lastSuccessMs: null,
+		lastSampleCount: 0,
+		lastError: null,
+		lastErrorMs: null,
+		inFlight: 0,
+	},
+	scraper: {
+		running: true,
+		targets: 0,
+		up: 0,
+		down: 0,
+		pending: 0,
+		stale: 0,
+		lastScrapeMs: null,
+		lastError: null,
+		lastErrorMs: null,
+	},
+	wal: {
+		startup: "idle",
+		lastCheckpointError: null,
+		lastCheckpointErrorMs: null,
+		lastReplayError: null,
+		lastReplayErrorMs: null,
+	},
+	storeOpen: true,
+	queryEngineReady: true,
+	lastIngestMs: null,
+	lastIngestSampleCount: 0,
+	lastIngestError: null,
+	lastIngestErrorMs: null,
+	inFlightIngests: 0,
 };
 
 describe("panel config", () => {
@@ -147,5 +192,77 @@ describe("panel data shaping", () => {
 		expect(formatStatValue(1234.5)).toBe("1234.50");
 		expect(formatStatValue(2_500_000)).toBe("2.50M");
 		expect(formatStatValue(Infinity)).toBe("∞");
+	});
+});
+
+describe("panel status messages", () => {
+	it("explains startup when health is unavailable", () => {
+		expect(panelUnavailableStatus(null)).toMatchObject({
+			tone: "empty",
+			title: "Metrics database is starting",
+		});
+	});
+
+	it("prioritizes ingest failures over generic no-data", () => {
+		const status = panelNoDataStatus({
+			...HEALTHY,
+			ingest: {
+				...HEALTHY.ingest,
+				lastError: "Error: database disk image is malformed",
+				lastErrorMs: 1,
+			},
+		});
+
+		expect(status).toMatchObject({
+			tone: "error",
+			title: "Ingest is failing",
+		});
+		expect(status.detail).toContain("malformed");
+	});
+
+	it("surfaces down scrape targets before generic no-data", () => {
+		const status = panelNoDataStatus({
+			...HEALTHY,
+			scraper: {
+				...HEALTHY.scraper,
+				targets: 1,
+				down: 1,
+				lastError: "connect ECONNREFUSED",
+			},
+		});
+
+		expect(status).toEqual({
+			tone: "warning",
+			title: "Scrape target down",
+			detail: "connect ECONNREFUSED",
+		});
+	});
+
+	it("distinguishes waiting for first scrape from an empty query", () => {
+		expect(
+			panelNoDataStatus({
+				...HEALTHY,
+				scraper: {
+					...HEALTHY.scraper,
+					targets: 2,
+					pending: 2,
+				},
+			})
+		).toMatchObject({
+			tone: "empty",
+			title: "Waiting for first scrape",
+		});
+		expect(panelNoDataStatus(HEALTHY)).toMatchObject({
+			tone: "empty",
+			title: "No data",
+		});
+	});
+
+	it("formats query errors", () => {
+		expect(panelQueryErrorStatus(new Error("parse failed"))).toEqual({
+			tone: "error",
+			title: "Query error",
+			detail: "parse failed",
+		});
 	});
 });

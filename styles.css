@@ -802,6 +802,38 @@
 	text-align: center;
 }
 
+.omx-panel-state {
+	padding: 14px 16px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background-color: var(--background-primary);
+	color: var(--text-muted);
+}
+
+.omx-panel-state.is-warning {
+	border-color: var(--background-modifier-border-hover);
+	color: var(--text-normal);
+}
+
+.omx-panel-state.is-error {
+	border-color: var(--text-error);
+	color: var(--text-normal);
+}
+
+.omx-panel-state-title {
+	font-size: 13px;
+	font-weight: 600;
+	color: inherit;
+}
+
+.omx-panel-state-detail {
+	margin-top: 4px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--text-muted);
+	overflow-wrap: anywhere;
+}
+
 .omx-panel .uplot {
 	width: 100%;
 	font-family: var(--font-interface, inherit);
