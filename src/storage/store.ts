@@ -63,6 +63,13 @@ interface CachedSeries {
 	labels: Labels;
 }
 
+interface IngestRow {
+	labels: Labels;
+	seriesKey: string;
+	ts: number;
+	value: number;
+}
+
 const CHUNK_VFS_NAME = "tsdb-chunks";
 const NODE_FILE_VFS_NAME = "tsdb-node-file";
 export const DEFAULT_CHUNK_DB_NAME = "metrics";
@@ -96,6 +103,8 @@ export class MetricsStore {
 
 	private seriesByKey = new Map<string, CachedSeries>();
 	private allSeries: CachedSeries[] = [];
+	private insertSeriesStmt: number | null = null;
+	private insertSampleStmt: number | null = null;
 
 	/**
 	 * wa-sqlite's Asyncify build forbids reentrant calls: while one
@@ -185,6 +194,55 @@ export class MetricsStore {
 		return result;
 	}
 
+	private async prepareStatement(sql: string): Promise<number> {
+		const sqlString = this.sqlite3.str_new(this.db, sql);
+		try {
+			const prepared = await this.sqlite3.prepare_v2(
+				this.db,
+				this.sqlite3.str_value(sqlString)
+			);
+			if (!prepared) {
+				throw new Error("tsdb: SQLite did not prepare a statement");
+			}
+			return prepared.stmt;
+		} finally {
+			this.sqlite3.str_finish(sqlString);
+		}
+	}
+
+	private async getInsertSeriesStmt(): Promise<number> {
+		if (this.insertSeriesStmt === null) {
+			this.insertSeriesStmt = await this.prepareStatement(
+				"INSERT INTO series (labels_key, labels_json) VALUES (?, ?) RETURNING id"
+			);
+		}
+		return this.insertSeriesStmt;
+	}
+
+	private async getInsertSampleStmt(): Promise<number> {
+		if (this.insertSampleStmt === null) {
+			this.insertSampleStmt = await this.prepareStatement(
+				"INSERT OR REPLACE INTO samples (series_id, ts, value) VALUES (?, ?, ?)"
+			);
+		}
+		return this.insertSampleStmt;
+	}
+
+	private async resetPreparedStatement(stmt: number): Promise<void> {
+		try {
+			await this.sqlite3.reset(stmt);
+		} catch (error) {
+			await this.discardPreparedStatement(stmt);
+			throw error;
+		}
+	}
+
+	private async discardPreparedStatement(stmt: number): Promise<void> {
+		if (this.insertSeriesStmt === stmt) this.insertSeriesStmt = null;
+		if (this.insertSampleStmt === stmt) this.insertSampleStmt = null;
+		await this.sqlite3.finalize(stmt).catch(() => undefined);
+	}
+
 	private async loadSeriesCache(): Promise<void> {
 		this.seriesByKey.clear();
 		this.allSeries = [];
@@ -202,23 +260,33 @@ export class MetricsStore {
 		);
 	}
 
-	private async getOrCreateSeries(labels: Labels): Promise<number> {
-		const key = canonicalLabels(labels);
-		const existing = this.seriesByKey.get(key);
-		if (existing) return existing.id;
+	private async createMissingSeries(rows: IngestRow[]): Promise<void> {
+		const missing = new Map<string, Labels>();
+		for (const row of rows) {
+			if (this.seriesByKey.has(row.seriesKey)) continue;
+			if (!missing.has(row.seriesKey)) missing.set(row.seriesKey, row.labels);
+		}
+		if (missing.size === 0) return;
 
-		const id = await this.withStatement(
-			"INSERT INTO series (labels_key, labels_json) VALUES (?, ?) RETURNING id",
-			async (stmt) => {
-				this.sqlite3.bind_collection(stmt, [key, JSON.stringify(labels)]);
-				await this.sqlite3.step(stmt);
-				return this.sqlite3.row(stmt)[0] as number;
+		const stmt = await this.getInsertSeriesStmt();
+		for (const [key, labels] of missing) {
+			this.sqlite3.bind_collection(stmt, [key, JSON.stringify(labels)]);
+			let id: number | null = null;
+			try {
+				if ((await this.sqlite3.step(stmt)) !== SQLite.SQLITE_ROW) {
+					throw new Error("tsdb: SQLite did not return a series id");
+				}
+				id = this.sqlite3.row(stmt)[0] as number;
+			} finally {
+				await this.resetPreparedStatement(stmt);
 			}
-		);
-		const cached: CachedSeries = { id, labels };
-		this.seriesByKey.set(key, cached);
-		this.allSeries.push(cached);
-		return cached.id;
+			if (id === null) {
+				throw new Error("tsdb: SQLite did not return a series id");
+			}
+			const cached: CachedSeries = { id, labels };
+			this.seriesByKey.set(key, cached);
+			this.allSeries.push(cached);
+		}
 	}
 
 	/** Append a batch of samples in one transaction (durable on commit). */
@@ -228,29 +296,40 @@ export class MetricsStore {
 	}
 
 	private async ingestLocked(samples: StoredSample[]): Promise<void> {
+		const rows: IngestRow[] = [];
+		for (const sample of samples) {
+			if (!Number.isFinite(sample.ts)) continue;
+			// SQLite stores NaN as NULL; drop such samples instead.
+			if (Number.isNaN(sample.value)) continue;
+			rows.push({
+				labels: sample.labels,
+				seriesKey: canonicalLabels(sample.labels),
+				ts: Math.round(sample.ts),
+				value: sample.value,
+			});
+		}
+		if (rows.length === 0) return;
+
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
-			await this.withStatement(
-				"INSERT OR REPLACE INTO samples (series_id, ts, value) VALUES (?, ?, ?)",
-				async (stmt) => {
-					for (const sample of samples) {
-						if (!Number.isFinite(sample.ts)) continue;
-						// SQLite stores NaN as NULL; drop such samples instead.
-						if (Number.isNaN(sample.value)) continue;
-						const seriesId = await this.getOrCreateSeries(sample.labels);
-						this.sqlite3.bind_collection(stmt, [
-							seriesId,
-							Math.round(sample.ts),
-							sample.value,
-						]);
-						await this.sqlite3.step(stmt);
-						await this.sqlite3.reset(stmt);
-					}
+			await this.createMissingSeries(rows);
+			const stmt = await this.getInsertSampleStmt();
+			for (const row of rows) {
+				const seriesId = this.seriesByKey.get(row.seriesKey)?.id;
+				if (seriesId === undefined) {
+					throw new Error("tsdb: series cache miss during ingest");
 				}
-			);
+				this.sqlite3.bind_collection(stmt, [seriesId, row.ts, row.value]);
+				try {
+					await this.sqlite3.step(stmt);
+				} finally {
+					await this.resetPreparedStatement(stmt);
+				}
+			}
 			await this.sqlite3.exec(this.db, "COMMIT");
 		} catch (error) {
 			await this.sqlite3.exec(this.db, "ROLLBACK").catch(() => undefined);
+			await this.loadSeriesCache().catch(() => undefined);
 			throw error;
 		}
 	}
@@ -435,7 +514,10 @@ export class MetricsStore {
 		if (this.closePromise) return this.closePromise;
 		this.closing = true;
 		this.closePromise = this.queue
-			.then(() => this.sqlite3.close(this.db))
+			.then(async () => {
+				await this.finalizePreparedStatements();
+				await this.sqlite3.close(this.db);
+			})
 			.then(
 				() => {
 					this.closed = true;
@@ -444,8 +526,17 @@ export class MetricsStore {
 					this.closed = true;
 					throw error;
 				}
-			);
+		);
 		return this.closePromise;
+	}
+
+	private async finalizePreparedStatements(): Promise<void> {
+		const stmts = [this.insertSeriesStmt, this.insertSampleStmt];
+		this.insertSeriesStmt = null;
+		this.insertSampleStmt = null;
+		for (const stmt of stmts) {
+			if (stmt !== null) await this.sqlite3.finalize(stmt);
+		}
 	}
 }
 

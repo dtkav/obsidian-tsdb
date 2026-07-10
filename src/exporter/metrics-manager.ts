@@ -4,6 +4,7 @@ import Counter from 'prom-client/lib/counter';
 import Gauge from 'prom-client/lib/gauge';
 import Histogram from 'prom-client/lib/histogram';
 import Summary from 'prom-client/lib/summary';
+import type { Labels } from '../labels';
 import {
 	CounterOptions,
 	GaugeOptions,
@@ -14,6 +15,23 @@ import {
 	LabeledMetricInstance,
 	MetricsRegistry
 } from '../types';
+
+interface RegistryMetricValue {
+	value: number;
+	labels?: Record<string, string | number>;
+	metricName?: string;
+}
+
+interface RegistryMetricJson {
+	name: string;
+	values?: RegistryMetricValue[];
+}
+
+export interface CollectedMetricSample {
+	name: string;
+	labels: Labels;
+	value: number;
+}
 
 export class MetricsManager implements MetricsRegistry {
 	private registry: Registry;
@@ -370,6 +388,30 @@ export class MetricsManager implements MetricsRegistry {
 
 	async getAllMetrics(): Promise<string> {
 		return await this.registry.metrics();
+	}
+
+	/**
+	 * Structured collection for in-process TSDB recording. This avoids turning
+	 * our own metrics into Prometheus text only to parse that text immediately.
+	 */
+	async collectSamples(): Promise<CollectedMetricSample[]> {
+		const metrics =
+			(await this.registry.getMetricsAsJSON()) as RegistryMetricJson[];
+		const samples: CollectedMetricSample[] = [];
+		for (const metric of metrics) {
+			for (const value of metric.values ?? []) {
+				const labels: Labels = {};
+				for (const [key, labelValue] of Object.entries(value.labels ?? {})) {
+					labels[key] = String(labelValue);
+				}
+				samples.push({
+					name: value.metricName ?? metric.name,
+					labels,
+					value: value.value,
+				});
+			}
+		}
+		return samples;
 	}
 
 	clearMetric(name: string): boolean {

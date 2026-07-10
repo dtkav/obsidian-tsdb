@@ -517,7 +517,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			.map((source) => ({
 				jobName: source.name,
 				intervalSeconds: this.storeConfig(source.name).intervalSeconds,
-				read: () => source.manager.getAllMetrics(),
+				collect: () => source.manager.collectSamples(),
 			}));
 		this.scraper.start(
 			this.settings.scrape.jobs.map((job) => ({ ...job })),

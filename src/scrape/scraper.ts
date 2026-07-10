@@ -24,7 +24,8 @@ export interface ScrapeJobConfig {
 export interface SelfSourceConfig {
 	jobName: string;
 	intervalSeconds: number;
-	read: () => Promise<string>;
+	read?: () => Promise<string>;
+	collect?: () => Promise<ScrapedSample[]>;
 }
 
 export const DEFAULT_SCRAPE_INTERVAL_SECONDS = 30;
@@ -32,6 +33,13 @@ export const DEFAULT_SCRAPE_TIMEOUT_SECONDS = 10;
 
 /** Labels every scrape attaches; colliding target labels get exported_ prefix. */
 const RESERVED_TARGET_LABELS = ["job", "instance"];
+
+export interface ScrapedSample {
+	name: string;
+	labels: Labels;
+	value: number;
+	timestampMs?: number;
+}
 
 export function fetchText(
 	url: string,
@@ -127,7 +135,20 @@ export function buildStoredSamples(
 	instance: string,
 	scrapeTimeMs: number
 ): StoredSample[] {
-	const parsed = parseExposition(text);
+	return buildStoredSamplesFromScraped(
+		parseExposition(text),
+		jobName,
+		instance,
+		scrapeTimeMs
+	);
+}
+
+export function buildStoredSamplesFromScraped(
+	parsed: ScrapedSample[],
+	jobName: string,
+	instance: string,
+	scrapeTimeMs: number
+): StoredSample[] {
 	const stored: StoredSample[] = [];
 	for (const sample of parsed) {
 		if (Number.isNaN(sample.value)) continue; // SQLite has no NaN; drop
@@ -268,14 +289,21 @@ export class Scraper {
 		this.inFlight.set(key, generation);
 		const started = Date.now();
 		try {
-			const text = await source.read();
+			const samples =
+				source.collect !== undefined
+					? buildStoredSamplesFromScraped(
+							await source.collect(),
+							source.jobName,
+							instance,
+							started
+						)
+					: buildStoredSamples(
+							await source.read!(),
+							source.jobName,
+							instance,
+							started
+						);
 			if (generation !== this.generation) return;
-			const samples = buildStoredSamples(
-				text,
-				source.jobName,
-				instance,
-				started
-			);
 			const duration = (Date.now() - started) / 1000;
 			samples.push(
 				...syntheticSamples(
