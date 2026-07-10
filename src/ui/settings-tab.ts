@@ -118,8 +118,10 @@ export class MetricsSettingTab extends PluginSettingTab {
 
 		const main = card.createDiv({ cls: "omx-settings-status-main" });
 		const port = this.plugin.boundPort;
+		const health = this.plugin.getHealthStatus();
 
 		const headline = main.createDiv({ cls: "omx-settings-status-headline" });
+		this.healthDot(headline, health.ok);
 		headline.createSpan({ text: "Time-series database" });
 
 		if (port !== null) {
@@ -170,6 +172,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 			dbLine.setText(`SQLite database — ${parts.join(" · ")}`);
 		});
 
+		this.displayHealthSummary(main, health);
+
 		const actions = main.createDiv({ cls: "omx-settings-status-actions" });
 		const openBtn = actions.createEl("button", { text: "Open dashboard" });
 		openBtn.onclick = () => void openMetricsDashboard(this.plugin);
@@ -182,6 +186,76 @@ export class MetricsSettingTab extends PluginSettingTab {
 		});
 		const sparkEl = sparkWrap.createDiv();
 		void this.renderSparkline(sparkEl, sparklineRenderId);
+	}
+
+	private displayHealthSummary(
+		parent: HTMLElement,
+		health: ReturnType<ObsidianMetricsPlugin["getHealthStatus"]>
+	): void {
+		const rows = parent.createDiv({ cls: "omx-settings-health" });
+		if (health.ok) {
+			rows.createDiv({
+				cls: "omx-settings-health-row is-ok",
+				text: "Recording, storage, and queries are healthy.",
+			});
+			return;
+		}
+
+		const addIssue = (text: string) => {
+			rows.createDiv({ cls: "omx-settings-health-row is-warning", text });
+		};
+
+		if (!health.store.open) {
+			addIssue("Database is not open.");
+		}
+		if (!health.queryEngine.ready) {
+			addIssue("Query engine is not ready.");
+		}
+		if (health.ingest.lastError) {
+			addIssue(`Last ingest failed: ${health.ingest.lastError}`);
+		}
+		if (health.scraper.down > 0 || health.scraper.stale > 0) {
+			const parts = [];
+			if (health.scraper.down > 0) {
+				const plural = health.scraper.down === 1 ? "" : "s";
+				parts.push(`${health.scraper.down} endpoint${plural} down`);
+			}
+			if (health.scraper.stale > 0) {
+				parts.push(`${health.scraper.stale} stale`);
+			}
+			const suffix = health.scraper.lastError
+				? `: ${health.scraper.lastError}`
+				: ".";
+			addIssue(`Scrapes need attention — ${parts.join(", ")}${suffix}`);
+		}
+		if (health.wal.lastCheckpointError) {
+			addIssue(`WAL checkpoint failed: ${health.wal.lastCheckpointError}`);
+		}
+		if (health.wal.lastReplayError) {
+			addIssue(`WAL replay failed: ${health.wal.lastReplayError}`);
+		}
+		if (health.wal.startup === "running") {
+			rows.createDiv({
+				cls: "omx-settings-health-row is-pending",
+				text: "WAL startup maintenance is running.",
+			});
+		}
+		if (
+			health.scraper.pending > 0 &&
+			health.scraper.targets > health.scraper.pending
+		) {
+			const plural = health.scraper.pending === 1 ? "" : "s";
+			rows.createDiv({
+				cls: "omx-settings-health-row is-pending",
+				text: `${health.scraper.pending} scrape target${plural} waiting for a first sample.`,
+			});
+		}
+		if (rows.childElementCount === 0) {
+			rows.createDiv({
+				cls: "omx-settings-health-row is-pending",
+				text: "Startup checks are still settling.",
+			});
+		}
 	}
 
 	private async renderSparkline(

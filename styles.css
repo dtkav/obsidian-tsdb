@@ -440,6 +440,31 @@
 	color: var(--text-muted);
 }
 
+.omx-settings-health {
+	display: grid;
+	gap: 4px;
+	margin-top: 8px;
+	font-size: 12px;
+	line-height: 1.35;
+}
+
+.omx-settings-health-row {
+	color: var(--text-muted);
+	overflow-wrap: anywhere;
+}
+
+.omx-settings-health-row.is-ok {
+	color: var(--text-muted);
+}
+
+.omx-settings-health-row.is-warning {
+	color: var(--text-error);
+}
+
+.omx-settings-health-row.is-pending {
+	color: var(--text-faint);
+}
+
 .omx-settings-sparkline {
 	flex: 1 1 100%;
 	width: 100%;
