@@ -97,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);
 export class MetricsStore {
 	private sqlite3: SQLiteAPI;
 	private db: number;
+	readonly recoveredFromCorruption: boolean;
 	private closing = false;
 	private closed = false;
 	private closePromise: Promise<void> | null = null;
@@ -126,9 +127,14 @@ export class MetricsStore {
 		return run;
 	}
 
-	private constructor(sqlite3: SQLiteAPI, db: number) {
+	private constructor(
+		sqlite3: SQLiteAPI,
+		db: number,
+		recoveredFromCorruption: boolean
+	) {
 		this.sqlite3 = sqlite3;
 		this.db = db;
+		this.recoveredFromCorruption = recoveredFromCorruption;
 	}
 
 	get isOpen(): boolean {
@@ -141,7 +147,9 @@ export class MetricsStore {
 			(options.location.kind === "node-file"
 				? DEFAULT_NODE_DB_NAME
 				: DEFAULT_CHUNK_DB_NAME);
-		const openOnce = async (): Promise<MetricsStore> => {
+		const openOnce = async (
+			recoveredFromCorruption: boolean
+		): Promise<MetricsStore> => {
 			const module: unknown = await SQLiteAsyncESMFactory(
 				options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}
 			);
@@ -156,13 +164,13 @@ export class MetricsStore {
 				SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
 				vfsName
 			);
-			const store = new MetricsStore(sqlite3, db);
+			const store = new MetricsStore(sqlite3, db, recoveredFromCorruption);
 			await store.init();
 			return store;
 		};
 
 		try {
-			return await openOnce();
+			return await openOnce(false);
 		} catch (error) {
 			// Unreadable/corrupt database: wipe the active backend and start fresh.
 			console.error(
@@ -170,7 +178,7 @@ export class MetricsStore {
 				error
 			);
 			await wipeDatabaseFiles(options.location, dbName);
-			return await openOnce();
+			return await openOnce(true);
 		}
 	}
 

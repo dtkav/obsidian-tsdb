@@ -82,6 +82,7 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 	it("round-trips samples through ingest/select", async () => {
 		const { store } = await openStore();
+		expect(store.recoveredFromCorruption).toBe(false);
 		await store.ingest([
 			{ labels: { [NAME]: "m", job: "a" }, ts: 1000, value: 1 },
 			{ labels: { [NAME]: "m", job: "a" }, ts: 2000, value: 2 },
@@ -196,6 +197,7 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		adapter.files.set("tsdb/metrics.c0", garbage.buffer.slice(0));
 
 		const { store } = await openStore(adapter);
+		expect(store.recoveredFromCorruption).toBe(true);
 		expect((await store.stats()).sampleCount).toBe(0);
 		await store.close();
 	});
@@ -301,6 +303,7 @@ describe("MetricsStore (wa-sqlite over Node file VFS)", () => {
 				location: { kind: "node-file", directory: dir },
 				wasmBinary: WASM,
 			});
+			expect(second.recoveredFromCorruption).toBe(false);
 			const data = await second.select(
 				[{ name: NAME, op: "=", value: "node_metric" }],
 				0,

@@ -109,4 +109,45 @@ describe("SampleWal", () => {
 		await wal.barrier();
 		expect(await wal.replayInto(collector())).toBe(1);
 	});
+
+	it("reports replay stats", async () => {
+		const adapter = makeAdapter();
+		const wal = new SampleWal(adapter, "metrics.wal");
+		wal.append([sample("a", 1000, 1), sample("b", 1000, 2)]);
+		wal.append([sample("a", 2000, 3)]);
+		await wal.barrier();
+
+		const result = await wal.replayIntoWithStats(collector());
+		expect(result).toEqual({
+			samples: 3,
+			batches: 2,
+			bytes: adapter.files.get("metrics.wal")!.length,
+			aborted: false,
+		});
+	});
+
+	it("can abort replay between batches", async () => {
+		const adapter = makeAdapter();
+		const wal = new SampleWal(adapter, "metrics.wal");
+		wal.append([sample("a", 1000, 1)]);
+		wal.append([sample("b", 2000, 2)]);
+		await wal.barrier();
+
+		let batches = 0;
+		const sink = {
+			ingested: [] as StoredSample[],
+			ingest: (samples: StoredSample[]) => {
+				batches++;
+				sink.ingested.push(...samples);
+			},
+		};
+		const result = await wal.replayIntoWithStats(sink, {
+			shouldContinue: () => batches === 0,
+		});
+
+		expect(result.aborted).toBe(true);
+		expect(result.samples).toBe(1);
+		expect(result.batches).toBe(1);
+		expect(sink.ingested.map((s) => s.labels.__name__)).toEqual(["a"]);
+	});
 });

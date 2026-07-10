@@ -12,6 +12,20 @@ export interface SampleSink {
 	ingest(samples: StoredSample[]): void | Promise<void>;
 }
 
+export interface WalReplayOptions {
+	/** Return false to stop replay after the current batch finishes. */
+	shouldContinue?: () => boolean;
+	/** Yield to the event loop every N valid batches. */
+	yieldEveryBatches?: number;
+}
+
+export interface WalReplayResult {
+	samples: number;
+	batches: number;
+	bytes: number;
+	aborted: boolean;
+}
+
 /**
  * Write-ahead log for scraped samples.
  *
@@ -53,30 +67,65 @@ export class SampleWal {
 	 * Replay logged samples into the store. Unparseable lines (e.g. a line
 	 * torn by a crash mid-append) are skipped. Returns the sample count.
 	 */
-	async replayInto(target: SampleSink): Promise<number> {
-		if (!(await this.adapter.exists(this.path))) return 0;
+	async replayInto(
+		target: SampleSink,
+		options: WalReplayOptions = {}
+	): Promise<number> {
+		return (await this.replayIntoWithStats(target, options)).samples;
+	}
+
+	async replayIntoWithStats(
+		target: SampleSink,
+		options: WalReplayOptions = {}
+	): Promise<WalReplayResult> {
+		if (!(await this.adapter.exists(this.path))) {
+			return { samples: 0, batches: 0, bytes: 0, aborted: false };
+		}
 		let text: string;
 		try {
 			text = await this.adapter.read(this.path);
 		} catch (error) {
 			console.warn("tsdb: could not read WAL", error);
-			return 0;
+			return { samples: 0, batches: 0, bytes: 0, aborted: false };
 		}
-		let count = 0;
-		for (const line of text.split("\n")) {
-			const trimmed = line.trim();
+		let samplesReplayed = 0;
+		let batchesReplayed = 0;
+		let offset = 0;
+		const yieldEveryBatches = Math.max(1, options.yieldEveryBatches ?? 25);
+		while (offset < text.length) {
+			if (options.shouldContinue && !options.shouldContinue()) {
+				return {
+					samples: samplesReplayed,
+					batches: batchesReplayed,
+					bytes: text.length,
+					aborted: true,
+				};
+			}
+			const newline = text.indexOf("\n", offset);
+			const end = newline === -1 ? text.length : newline;
+			const trimmed = text.slice(offset, end).trim();
+			offset = newline === -1 ? text.length : newline + 1;
 			if (!trimmed) continue;
 			try {
 				const samples = JSON.parse(trimmed) as StoredSample[];
 				if (Array.isArray(samples) && samples.length > 0) {
 					await target.ingest(samples);
-					count += samples.length;
+					samplesReplayed += samples.length;
+					batchesReplayed++;
+					if (batchesReplayed % yieldEveryBatches === 0) {
+						await new Promise<void>((resolve) => setTimeout(resolve, 0));
+					}
 				}
 			} catch {
 				// Torn or corrupt line — skip it, keep the rest.
 			}
 		}
-		return count;
+		return {
+			samples: samplesReplayed,
+			batches: batchesReplayed,
+			bytes: text.length,
+			aborted: false,
+		};
 	}
 
 	/** Wait for all pending appends to reach the file. */

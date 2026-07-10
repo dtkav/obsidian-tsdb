@@ -87,6 +87,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private sources: MetricSourceRegistry | null = null;
 	private store: MetricsStore | null = null;
 	private wal: SampleWal | null = null;
+	private walStartupPromise: Promise<void> | null = null;
+	private walReplayCancelled = false;
 	private scraper: Scraper | null = null;
 	private tsdbMetrics: TsdbMetricsRecorder | null = null;
 	private settingsTab: MetricsSettingTab | null = null;
@@ -219,19 +221,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			wasmBinary: waSqliteWasm,
 		});
 
-		// The WAL remains as a recovery net: entries are only written after
-		// their transaction commits, replayed (idempotently) on startup, and
-		// truncated periodically.
+		// The WAL remains as a recovery net. Entries are written only after
+		// their SQLite transaction commits, so a healthy database can checkpoint
+		// the log immediately; replay is only needed after store recovery.
 		this.wal = new SampleWal(
 			this.app.vault.adapter,
 			`${this.manifest.dir}/${WAL_FILENAME}`
 		);
-		const replayed = await this.wal.replayInto(this.store);
-		if (replayed > 0) {
-			console.log(
-				`tsdb: replayed ${replayed} samples from write-ahead log`
-			);
-		}
+		this.startWalStartupMaintenance();
 
 		this.scraper = new Scraper(
 			{
@@ -475,6 +472,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.removeStatusBarItem();
 		await this.stopMetricsServer(true);
 		this.apiServer?.dispose();
+		this.walReplayCancelled = true;
 		await this.waitForInFlightIngests();
 		await this.flushStore();
 		await this.store?.close().catch((error) => {
@@ -485,6 +483,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.scraper = null;
 		this.apiServer = null;
 		this.wal = null;
+		this.walStartupPromise = null;
+		this.walReplayCancelled = false;
 		this.store = null;
 		this.engine = null;
 		this.api = {
@@ -769,6 +769,10 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		const started = performance.now();
 		let status: "ok" | "error" | "skipped" = "ok";
 		try {
+			if (this.walStartupPromise) {
+				status = "skipped";
+				return;
+			}
 			const epoch = this.wal.epoch;
 			await this.wal.barrier();
 			if (this.wal.epoch === epoch) {
@@ -783,6 +787,96 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				status
 			);
 		}
+	}
+
+	private startWalStartupMaintenance(): void {
+		if (!this.wal || !this.store) return;
+		const wal = this.wal;
+		const store = this.store;
+		const started = performance.now();
+		this.walReplayCancelled = false;
+		const recovery = store.recoveredFromCorruption
+			? this.replayWalAfterStoreRecovery(wal, store, started)
+			: this.checkpointWalAfterHealthyOpen(wal, started);
+		const tracked = recovery.finally(() => {
+			if (this.walStartupPromise === tracked) {
+				this.walStartupPromise = null;
+			}
+		});
+		this.walStartupPromise = tracked;
+	}
+
+	private async checkpointWalAfterHealthyOpen(
+		wal: SampleWal,
+		started: number
+	): Promise<void> {
+		let status: "ok" | "error" = "ok";
+		try {
+			await wal.truncate();
+		} catch (error) {
+			status = "error";
+			console.error("tsdb: WAL startup checkpoint failed", error);
+		} finally {
+			this.tsdbMetrics?.recordWalCheckpoint(
+				(performance.now() - started) / 1000,
+				status
+			);
+		}
+	}
+
+	private async replayWalAfterStoreRecovery(
+		wal: SampleWal,
+		store: MetricsStore,
+		started: number
+	): Promise<void> {
+		await wal
+			.replayIntoWithStats(store, {
+				shouldContinue: () =>
+					!this.walReplayCancelled &&
+					!this.isUnloading &&
+					this.wal === wal &&
+					this.store === store,
+			})
+			.then(async (result) => {
+				const durationSeconds = (performance.now() - started) / 1000;
+				if (result.aborted) {
+					console.log(
+						`tsdb: WAL replay stopped after ${result.samples} samples`
+					);
+					this.tsdbMetrics?.recordWalReplay(
+						result.samples,
+						result.batches,
+						result.bytes,
+						durationSeconds,
+						"aborted"
+					);
+					return;
+				}
+				await wal.barrier();
+				await wal.truncate();
+				if (result.samples > 0 || result.bytes > 0) {
+					console.log(
+						`tsdb: replayed ${result.samples} samples from write-ahead log`
+					);
+				}
+				this.tsdbMetrics?.recordWalReplay(
+					result.samples,
+					result.batches,
+					result.bytes,
+					durationSeconds,
+					"ok"
+				);
+			})
+			.catch((error) => {
+				this.tsdbMetrics?.recordWalReplay(
+					0,
+					0,
+					0,
+					(performance.now() - started) / 1000,
+					"error"
+				);
+				console.error("tsdb: WAL replay failed", error);
+			});
 	}
 
 	async getTsdbStats(): Promise<StoreStats | null> {
