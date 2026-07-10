@@ -107,6 +107,32 @@ describe("PromQL engine", () => {
 		}
 	});
 
+	it("deduplicates identical selector fetches within a query", async () => {
+		let selectCalls = 0;
+		const ds: DataSource = {
+			select: async (_matchers, startMs, endMs) => {
+				selectCalls++;
+				return [
+					{
+						labels: { __name__: "m", job: "a" },
+						points: [{ t: T, v: 7 }].filter(
+							(p) => p.t >= startMs && p.t <= endMs
+						),
+					},
+				];
+			},
+		};
+		const engine = new PromQLEngine(ds);
+
+		const result = await engine.instantQuery("m + m", T);
+
+		expect(selectCalls).toBe(1);
+		expect(result.resultType).toBe("vector");
+		if (result.resultType === "vector") {
+			expect(Number(result.result[0].value[1])).toBe(14);
+		}
+	});
+
 	it("returns nothing when the only sample is outside the lookback window", async () => {
 		const ds = makeDs([
 			{ labels: { __name__: "m" }, points: [{ t: 0, v: 7 }] },

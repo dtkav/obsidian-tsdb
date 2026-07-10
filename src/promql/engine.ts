@@ -1118,13 +1118,20 @@ export class PromQLEngine {
 		const selectors: Selector[] = [];
 		collectSelectors(expr, selectors);
 		const data: SelectorData = new Map();
+		const fetches = new Map<string, Promise<SeriesData[]>>();
 		await Promise.all(
 			selectors.map(async (selector) => {
 				const offset = selector.offsetMs;
 				const back = selector.rangeMs ?? this.lookbackMs;
 				const start = times[0] - offset - back;
 				const end = times[times.length - 1] - offset;
-				data.set(selector, await this.ds.select(selector.matchers, start, end));
+				const key = selectorFetchKey(selector.matchers, start, end);
+				let fetch = fetches.get(key);
+				if (!fetch) {
+					fetch = this.ds.select(selector.matchers, start, end);
+					fetches.set(key, fetch);
+				}
+				data.set(selector, await fetch);
 			})
 		);
 		return data;
@@ -1254,3 +1261,24 @@ export class PromQLEngine {
 }
 
 export { PromQLError };
+
+function selectorFetchKey(
+	matchers: Matcher[],
+	startMs: number,
+	endMs: number
+): string {
+	const normalizedMatchers = matchers
+		.map((matcher) => ({
+			name: matcher.name,
+			op: matcher.op,
+			value: matcher.value,
+		}))
+		.sort((a, b) => {
+			const byName = a.name.localeCompare(b.name);
+			if (byName !== 0) return byName;
+			const byOp = a.op.localeCompare(b.op);
+			if (byOp !== 0) return byOp;
+			return a.value.localeCompare(b.value);
+		});
+	return JSON.stringify([startMs, endMs, normalizedMatchers]);
+}
