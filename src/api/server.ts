@@ -24,6 +24,7 @@ export interface ApiServerDeps {
 	getExposition: () => Promise<string>;
 	engine: PromQLEngine;
 	store: MetricsStore;
+	getHealth: () => ApiHealthStatus;
 	getMetricsPath: () => string;
 	pluginVersion: string;
 }
@@ -51,6 +52,17 @@ export function parseStepParam(raw: string): number {
 interface ApiRequest {
 	params: URLSearchParams;
 	pathname: string;
+}
+
+export interface ApiHealthStatus {
+	ok: boolean;
+	storeOpen: boolean;
+	queryEngineReady: boolean;
+	lastIngestMs: number | null;
+	lastIngestSampleCount: number;
+	lastIngestError: string | null;
+	lastIngestErrorMs: number | null;
+	inFlightIngests: number;
 }
 
 /**
@@ -217,10 +229,12 @@ export class ApiServer {
 				return;
 			}
 			if (pathname === "/health" || pathname === "/-/healthy") {
-				this.json(res, 200, {
-					status: "ok",
+				const health = deps.getHealth();
+				this.json(res, health.ok ? 200 : 503, {
+					status: health.ok ? "ok" : "error",
 					timestamp: new Date().toISOString(),
 					metrics_endpoint: deps.getMetricsPath(),
+					...health,
 				});
 				return;
 			}

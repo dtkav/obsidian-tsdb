@@ -15,12 +15,10 @@ export interface SampleSink {
 /**
  * Write-ahead log for scraped samples.
  *
- * sql.js keeps the whole database in memory; persisting it means rewriting
- * the full file image, which is too expensive to do per scrape. Instead,
- * every ingested batch is appended here as one JSON line, making samples
- * durable immediately. On startup the log is replayed into the store
- * (idempotent: the store overwrites duplicate (series, ts) pairs), and the
- * log is truncated after each successful snapshot flush.
+ * SQLite commits are already durable through the active VFS. This log is a
+ * second recovery net for scrape batches: every committed batch is appended as
+ * one JSON line, replayed idempotently on startup, and periodically truncated
+ * after all pending appends have landed.
  */
 export class SampleWal {
 	private adapter: WalAdapter;
@@ -88,7 +86,8 @@ export class SampleWal {
 
 	/**
 	 * Clear the log. Callers must only truncate entries that are covered by
-	 * a snapshot: check that `epoch` is unchanged between snapshotting and
+	 * committed SQLite transactions: check that `epoch` is unchanged between
+	 * waiting for pending appends and
 	 * truncating, and skip otherwise (the next flush picks them up; replay
 	 * being idempotent makes late truncation safe, early truncation is not).
 	 */

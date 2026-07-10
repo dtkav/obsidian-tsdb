@@ -2,7 +2,7 @@ import { Labels, NAME_LABEL } from "../labels";
 import { StoredSample } from "../storage/store";
 import { SampleSink } from "../storage/wal";
 import { parseExposition } from "./parser";
-import type { HttpModule, UrlModule } from "../types/runtime";
+import type { ClientRequest, HttpModule, UrlModule } from "../types/runtime";
 
 // The Electron renderer that hosts plugins exposes CommonJS require; call it
 // through an alias so the Node builtins load at runtime without importing them.
@@ -46,32 +46,64 @@ export function fetchText(
 			reject(new Error(`invalid target URL: ${url}`));
 			return;
 		}
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+			reject(new Error(`unsupported target URL protocol: ${parsed.protocol}`));
+			return;
+		}
 		const lib = parsed.protocol === "https:" ? https : http;
-		const req = lib.get(parsed, { timeout: timeoutMs }, (res) => {
-			const status = res.statusCode ?? 0;
-			if (status >= 300 && status < 400 && res.headers.location) {
-				res.resume();
-				if (maxRedirects <= 0) {
-					reject(new Error(`too many redirects for ${url}`));
+		let req: ClientRequest | null = null;
+		let settled = false;
+		const timeoutId = window.setTimeout(() => {
+			const error = new Error(`scrape timeout for ${url}`);
+			req?.destroy(error);
+			fail(error);
+		}, Math.max(1, timeoutMs));
+		const succeed = (text: string) => {
+			if (settled) return;
+			settled = true;
+			window.clearTimeout(timeoutId);
+			resolve(text);
+		};
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			window.clearTimeout(timeoutId);
+			reject(error);
+		};
+		try {
+			req = lib.get(parsed, { timeout: timeoutMs }, (res) => {
+				const status = res.statusCode ?? 0;
+				if (status >= 300 && status < 400 && res.headers.location) {
+					res.resume();
+					if (maxRedirects <= 0) {
+						fail(new Error(`too many redirects for ${url}`));
+						return;
+					}
+					const next = new URL(res.headers.location, parsed).toString();
+					fetchText(next, timeoutMs, maxRedirects - 1).then(succeed, (error) =>
+						fail(error instanceof Error ? error : new Error(String(error)))
+					);
 					return;
 				}
-				const next = new URL(res.headers.location, parsed).toString();
-				fetchText(next, timeoutMs, maxRedirects - 1).then(resolve, reject);
-				return;
-			}
-			if (status !== 200) {
-				res.resume();
-				reject(new Error(`unexpected status ${status} from ${url}`));
-				return;
-			}
-			res.setEncoding("utf8");
-			let body = "";
-			res.on("data", (chunk) => (body += chunk));
-			res.on("end", () => resolve(body));
-			res.on("error", reject);
-		});
-		req.on("timeout", () => req.destroy(new Error(`scrape timeout for ${url}`)));
-		req.on("error", reject);
+				if (status !== 200) {
+					res.resume();
+					fail(new Error(`unexpected status ${status} from ${url}`));
+					return;
+				}
+				res.setEncoding("utf8");
+				let body = "";
+				res.on("data", (chunk) => (body += chunk));
+				res.on("end", () => succeed(body));
+				res.on("error", fail);
+			});
+		} catch (error) {
+			fail(error instanceof Error ? error : new Error(String(error)));
+			return;
+		}
+		req.on("timeout", () =>
+			req?.destroy(new Error(`scrape timeout for ${url}`))
+		);
+		req.on("error", fail);
 	});
 }
 
@@ -154,19 +186,26 @@ export interface ScraperStatus {
 	up: boolean;
 }
 
+export type ScrapeStatusChangeListener = () => void;
+
 /**
  * Schedules scrapes of the plugin's own registry and of external HTTP
  * targets, writing samples into the MetricsStore.
  */
 export class Scraper {
 	private sink: SampleSink;
+	private onTargetStatusChange: ScrapeStatusChangeListener | null;
 	private timers: number[] = [];
-	private inFlight = new Set<string>();
+	private inFlight = new Map<string, number>();
 	private statuses = new Map<string, ScraperStatus>();
 	private generation = 0;
 
-	constructor(sink: SampleSink) {
+	constructor(
+		sink: SampleSink,
+		onTargetStatusChange: ScrapeStatusChangeListener | null = null
+	) {
 		this.sink = sink;
+		this.onTargetStatusChange = onTargetStatusChange;
 	}
 
 	start(
@@ -176,6 +215,8 @@ export class Scraper {
 	): void {
 		this.stop();
 		const generation = ++this.generation;
+		this.statuses.clear();
+		this.onTargetStatusChange?.();
 
 		for (const source of selfSources) {
 			const run = () => void this.scrapeSelf(source, instance, generation);
@@ -202,6 +243,7 @@ export class Scraper {
 	stop(): void {
 		for (const timer of this.timers) window.clearInterval(timer);
 		this.timers = [];
+		this.inFlight.clear();
 		this.generation++;
 	}
 
@@ -222,8 +264,8 @@ export class Scraper {
 		generation: number
 	): Promise<void> {
 		const key = `${source.jobName}//self`;
-		if (this.inFlight.has(key)) return;
-		this.inFlight.add(key);
+		if (this.inFlight.get(key) === generation) return;
+		this.inFlight.set(key, generation);
 		const started = Date.now();
 		try {
 			const text = await source.read();
@@ -255,7 +297,7 @@ export class Scraper {
 			if (generation !== this.generation) return;
 			this.setStatus(key, source.jobName, "self", started, String(error));
 		} finally {
-			this.inFlight.delete(key);
+			if (this.inFlight.get(key) === generation) this.inFlight.delete(key);
 		}
 	}
 
@@ -265,8 +307,8 @@ export class Scraper {
 		generation: number
 	): Promise<void> {
 		const key = `${job.jobName}//${target}`;
-		if (this.inFlight.has(key)) return;
-		this.inFlight.add(key);
+		if (this.inFlight.get(key) === generation) return;
+		this.inFlight.set(key, generation);
 		const instance = instanceFromTarget(target);
 		const started = Date.now();
 		try {
@@ -288,16 +330,15 @@ export class Scraper {
 				)
 			);
 			if (generation !== this.generation) return;
+			this.setStatus(key, job.jobName, target, started, null, true);
 			await this.sink.ingest(samples);
 			if (generation !== this.generation) return;
-			this.setStatus(key, job.jobName, target, started, null);
 		} catch (error) {
 			if (generation !== this.generation) return;
+			this.setStatus(key, job.jobName, target, started, String(error), true);
 			await this.recordFailure(job.jobName, instance, started);
-			if (generation !== this.generation) return;
-			this.setStatus(key, job.jobName, target, started, String(error));
 		} finally {
-			this.inFlight.delete(key);
+			if (this.inFlight.get(key) === generation) this.inFlight.delete(key);
 		}
 	}
 
@@ -327,7 +368,8 @@ export class Scraper {
 		job: string,
 		target: string,
 		lastScrapeMs: number,
-		lastError: string | null
+		lastError: string | null,
+		notify = false
 	): void {
 		this.statuses.set(key, {
 			job,
@@ -336,5 +378,6 @@ export class Scraper {
 			lastError,
 			up: lastError === null,
 		});
+		if (notify) this.onTargetStatusChange?.();
 	}
 }

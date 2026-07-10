@@ -2,7 +2,7 @@ import { MarkdownView, Notice, Plugin } from "obsidian";
 // esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
 import waSqliteWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
 import { installMetricsGlobal } from "./api/debug-global";
-import { ApiServer } from "./api/server";
+import { ApiHealthStatus, ApiServer } from "./api/server";
 import {
 	setupPerformanceMetrics,
 	setupVaultMetrics,
@@ -22,8 +22,24 @@ import {
 import { IObsidianMetricsRootAPI } from "./types";
 import type { ErrnoError } from "./types/runtime";
 import { PromQLPanel } from "./panels/panel";
-import { migrateLegacySnapshot } from "./storage/chunk-vfs";
-import { MetricsStore, StoreStats, StoredSample } from "./storage/store";
+import {
+	migrateLegacySnapshot,
+	readChunkedDatabaseImage,
+} from "./storage/chunk-vfs";
+import {
+	DEFAULT_CHUNK_DB_NAME,
+	DEFAULT_NODE_DB_NAME,
+	MetricsStore,
+	StoreLocation,
+	StoreStats,
+	StoredSample,
+} from "./storage/store";
+import {
+	migrateLegacySnapshotToNodeFile,
+	nodeFileExists,
+	nodeStorageDirectoryForAdapter,
+	writeNodeFileDatabase,
+} from "./storage/node-file-vfs";
 import { SampleWal } from "./storage/wal";
 import { TimeContext } from "./time/context";
 import { TimeSelectorController } from "./time/selector";
@@ -42,12 +58,25 @@ declare module "obsidian" {
 	}
 }
 
+declare global {
+	interface Window {
+		__tsdbTeardownPromise?: Promise<void>;
+	}
+}
+
 const LEGACY_DB_FILENAME = "metrics.db";
 const TSDB_DIRNAME = "metrics-tsdb";
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
 const PROMQL_BLOCK_RE = /```[ \t]*promql[^\r\n]*(?:\r?\n)([\s\S]*?)(?:\r?\n)```/gi;
 const STALE_PROMQL_PANEL_TEXT = "promql panel: metrics store is not running";
+
+interface IngestHealth {
+	lastIngestMs: number | null;
+	lastIngestSampleCount: number;
+	lastIngestError: string | null;
+	lastIngestErrorMs: number | null;
+}
 
 export default class ObsidianMetricsPlugin extends Plugin {
 	settings: ObsidianMetricsSettings = DEFAULT_SETTINGS;
@@ -56,6 +85,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private store: MetricsStore | null = null;
 	private wal: SampleWal | null = null;
 	private scraper: Scraper | null = null;
+	private settingsTab: MetricsSettingTab | null = null;
 	/** Query engine over the local TSDB (used by the API and note panels). */
 	public engine: PromQLEngine | null = null;
 	private apiServer: ApiServer | null = null;
@@ -63,6 +93,13 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private flushTimer: number | null = null;
 	private retentionTimer: number | null = null;
 	private markdownRefreshScheduled = false;
+	private inFlightIngests = new Set<Promise<void>>();
+	private storeHealth: IngestHealth = {
+		lastIngestMs: null,
+		lastIngestSampleCount: 0,
+		lastIngestError: null,
+		lastIngestErrorMs: null,
+	};
 	public isUnloading = false;
 
 	public timeContext: TimeContext = new TimeContext();
@@ -76,6 +113,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 
 	async onload() {
 		this.isUnloading = false;
+		await this.waitForPreviousTeardown();
 		await this.loadSettings();
 
 		// Exporter side: metric stores (named registries, each recorded at
@@ -117,28 +155,53 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				"Browser memory usage and measured Obsidian API timings.",
 		});
 
-		// TSDB side: SQLite (wa-sqlite over the chunked vault-adapter VFS),
-		// WAL, scraper and query API. Every committed ingest is durable —
-		// there are no whole-image snapshots anymore.
+		// TSDB side: SQLite (wa-sqlite over a desktop .sqlite file when
+		// available, else the vault-adapter chunk VFS), WAL, scraper and query
+		// API. Every committed ingest is durable.
 		const adapter = this.app.vault.adapter;
-		const tsdbDir = `${this.manifest.dir}/${TSDB_DIRNAME}`;
-		try {
-			// One-time migration from the old sql.js whole-file snapshot.
-			const migrated = await migrateLegacySnapshot(
-				adapter,
-				`${this.manifest.dir}/${LEGACY_DB_FILENAME}`,
-				tsdbDir,
-				"metrics"
-			);
-			if (migrated) {
-				console.log("tsdb: migrated legacy metrics.db snapshot");
-			}
-		} catch (error) {
-			console.warn("tsdb: legacy snapshot migration failed", error);
-		}
-		this.store = await MetricsStore.open({
+		const pluginDir = this.pluginDirectory();
+		const tsdbDir = `${pluginDir}/${TSDB_DIRNAME}`;
+		let storeLocation: StoreLocation = {
+			kind: "chunks",
 			adapter,
 			directory: tsdbDir,
+		};
+		let storeDbName = DEFAULT_CHUNK_DB_NAME;
+		const nodeDirectory = this.getNodeStorageDirectory();
+		if (nodeDirectory) {
+			try {
+				await this.prepareNodeFileDatabase(nodeDirectory, tsdbDir);
+				storeLocation = {
+					kind: "node-file",
+					directory: nodeDirectory,
+				};
+				storeDbName = DEFAULT_NODE_DB_NAME;
+			} catch (error) {
+				console.warn(
+					"tsdb: desktop sqlite backend unavailable, falling back to chunks",
+					error
+				);
+			}
+		}
+		if (storeLocation.kind === "chunks") {
+			try {
+				// One-time migration from the old sql.js whole-file snapshot.
+				const migrated = await migrateLegacySnapshot(
+					adapter,
+					`${pluginDir}/${LEGACY_DB_FILENAME}`,
+					tsdbDir,
+					DEFAULT_CHUNK_DB_NAME
+				);
+				if (migrated) {
+					console.log("tsdb: migrated legacy metrics.db snapshot");
+				}
+			} catch (error) {
+				console.warn("tsdb: legacy snapshot migration failed", error);
+			}
+		}
+		this.store = await MetricsStore.open({
+			location: storeLocation,
+			dbName: storeDbName,
 			wasmBinary: waSqliteWasm,
 		});
 
@@ -158,13 +221,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 
 		this.scraper = new Scraper({
 			ingest: (samples: StoredSample[]) => this.ingestDurably(samples),
-		});
+		}, () => this.settingsTab?.onScrapeStatusChanged());
 
 		this.engine = new PromQLEngine(this.store);
 		this.apiServer = new ApiServer({
 			getExposition: () => this.getExposition(),
 			engine: this.engine,
 			store: this.store,
+			getHealth: () => this.getHealthStatus(),
 			getMetricsPath: () => this.settings.serverConfig.path,
 			pluginVersion: this.manifest.version,
 		});
@@ -217,7 +281,11 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				new Notice("All custom metrics cleared");
 			},
 		});
-		this.addSettingTab(new MetricsSettingTab(this.app, this));
+		this.settingsTab = new MetricsSettingTab(this.app, this);
+		this.addSettingTab(this.settingsTab);
+		this.register(() => {
+			this.settingsTab = null;
+		});
 		new TimeSelectorController(this, this.timeContext);
 
 		this.registerView(
@@ -266,7 +334,28 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.isUnloading = true;
 		// onunload must return void (Obsidian does not await it); run the
 		// async teardown as a detached task.
-		void this.teardown();
+		const teardown = this.teardown();
+		window.__tsdbTeardownPromise = teardown;
+		const clearTeardown = () => {
+			if (window.__tsdbTeardownPromise === teardown) {
+				delete window.__tsdbTeardownPromise;
+			}
+		};
+		void teardown.then(clearTeardown, clearTeardown);
+	}
+
+	private async waitForPreviousTeardown(): Promise<void> {
+		const previous = window.__tsdbTeardownPromise;
+		if (!previous) return;
+		try {
+			await previous;
+		} catch (error) {
+			console.warn("tsdb: previous plugin teardown failed", error);
+		} finally {
+			if (window.__tsdbTeardownPromise === previous) {
+				delete window.__tsdbTeardownPromise;
+			}
+		}
 	}
 
 	private refreshMarkdownPreviews(): void {
@@ -359,6 +448,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.removeStatusBarItem();
 		await this.stopMetricsServer(true);
 		this.apiServer?.dispose();
+		await this.waitForInFlightIngests();
 		await this.flushStore();
 		await this.store?.close().catch((error) => {
 			console.error("tsdb: error closing store", error);
@@ -398,7 +488,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		} catch (error: unknown) {
 			console.warn("Metrics server failed to start:", error);
 			const range = end > start ? `ports ${start}-${end}` : `port ${start}`;
-			let message = `Metrics server disabled - ${range} not available`;
+			let message = `TSDB API could not start - ${range} not available`;
 			const code = (error as ErrnoError | undefined)?.code;
 			if (code === "EADDRINUSE") {
 				message += ". Other services are using these ports.";
@@ -406,8 +496,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				message += ". Permission denied (try ports > 1024).";
 			}
 			new Notice(message + " Change port in plugin settings.", 8000);
-			this.settings.serverConfig.enabled = false;
-			await this.saveSettings();
 		}
 		this.updateStatusBar();
 	}
@@ -493,6 +581,70 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		return this.scraper?.getStatuses() ?? [];
 	}
 
+	// -- storage backend -----------------------------------------------------
+
+	private getNodeStorageDirectory(): string | null {
+		return nodeStorageDirectoryForAdapter(
+			this.app.vault.adapter as { getBasePath?: () => string },
+			this.pluginDirectory()
+		);
+	}
+
+	private pluginDirectory(): string {
+		return this.manifest.dir ?? this.manifest.id;
+	}
+
+	private async prepareNodeFileDatabase(
+		nodeDirectory: string,
+		chunkDirectory: string
+	): Promise<void> {
+		if (await nodeFileExists(nodeDirectory, DEFAULT_NODE_DB_NAME)) return;
+
+		const legacyPath = `${this.pluginDirectory()}/${LEGACY_DB_FILENAME}`;
+		const migratedLegacy = await migrateLegacySnapshotToNodeFile(
+			this.app.vault.adapter,
+			legacyPath,
+			nodeDirectory,
+			DEFAULT_NODE_DB_NAME
+		);
+		if (migratedLegacy) {
+			console.log("tsdb: migrated legacy metrics.db snapshot to metrics.sqlite");
+			return;
+		}
+
+		const existingChunkImage = await readChunkedDatabaseImage(
+			this.app.vault.adapter,
+			chunkDirectory,
+			DEFAULT_CHUNK_DB_NAME
+		);
+		if (!existingChunkImage || existingChunkImage.byteLength === 0) return;
+
+		const chunkStore = await MetricsStore.open({
+			location: {
+				kind: "chunks",
+				adapter: this.app.vault.adapter,
+				directory: chunkDirectory,
+			},
+			dbName: DEFAULT_CHUNK_DB_NAME,
+			wasmBinary: waSqliteWasm,
+		});
+		await chunkStore.close();
+
+		const chunkImage = await readChunkedDatabaseImage(
+			this.app.vault.adapter,
+			chunkDirectory,
+			DEFAULT_CHUNK_DB_NAME
+		);
+		if (chunkImage && chunkImage.byteLength > 0) {
+			await writeNodeFileDatabase(
+				nodeDirectory,
+				DEFAULT_NODE_DB_NAME,
+				chunkImage
+			);
+			console.log("tsdb: seeded metrics.sqlite from chunked database");
+		}
+	}
+
 	restartMaintenanceTimers(): void {
 		this.clearMaintenanceTimers();
 		this.flushTimer = window.setInterval(
@@ -529,9 +681,35 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	 * contains samples that are already committed, so truncation is safe.
 	 */
 	private async ingestDurably(samples: StoredSample[]): Promise<void> {
+		const task = this.ingestDurablyTracked(samples);
+		this.inFlightIngests.add(task);
+		task.then(
+			() => this.inFlightIngests.delete(task),
+			() => this.inFlightIngests.delete(task)
+		);
+		return task;
+	}
+
+	private async ingestDurablyTracked(samples: StoredSample[]): Promise<void> {
 		if (!this.store) return;
-		await this.store.ingest(samples);
-		this.wal?.append(samples);
+		try {
+			await this.store.ingest(samples);
+			this.storeHealth.lastIngestMs = Date.now();
+			this.storeHealth.lastIngestSampleCount = samples.length;
+			this.storeHealth.lastIngestError = null;
+			this.storeHealth.lastIngestErrorMs = null;
+			this.wal?.append(samples);
+		} catch (error) {
+			this.storeHealth.lastIngestError = String(error);
+			this.storeHealth.lastIngestErrorMs = Date.now();
+			throw error;
+		}
+	}
+
+	private async waitForInFlightIngests(): Promise<void> {
+		while (this.inFlightIngests.size > 0) {
+			await Promise.allSettled(Array.from(this.inFlightIngests));
+		}
 	}
 
 	/**
@@ -557,6 +735,26 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		} catch {
 			return null;
 		}
+	}
+
+	getHealthStatus(): ApiHealthStatus {
+		const storeOpen = this.store?.isOpen ?? false;
+		const queryEngineReady = this.engine !== null;
+		const ok =
+			!this.isUnloading &&
+			storeOpen &&
+			queryEngineReady &&
+			this.storeHealth.lastIngestError === null;
+		return {
+			ok,
+			storeOpen,
+			queryEngineReady,
+			lastIngestMs: this.storeHealth.lastIngestMs,
+			lastIngestSampleCount: this.storeHealth.lastIngestSampleCount,
+			lastIngestError: this.storeHealth.lastIngestError,
+			lastIngestErrorMs: this.storeHealth.lastIngestErrorMs,
+			inFlightIngests: this.inFlightIngests.size,
+		};
 	}
 
 	// -- misc ----------------------------------------------------------------

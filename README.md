@@ -11,9 +11,9 @@ external endpoint scraping are available under advanced settings.
 
 ## What it does
 
-- **Local time-series database**: stores samples in SQLite through `wa-sqlite`
-  and a vault-adapter VFS, so data is persisted as chunk files without native
-  modules.
+- **Local time-series database**: stores samples in SQLite through `wa-sqlite`.
+  Desktop vaults use a normal `metrics.sqlite` file; mobile and non-filesystem
+  adapters fall back to vault-adapter chunk files without native modules.
 - **Plugin metric registration**: other plugins register named metric stores
   with `app.plugins.plugins["tsdb"].api.getStore(...)` or the `tsdb:ready`
   workspace event.
@@ -52,9 +52,12 @@ external endpoint scraping are available under advanced settings.
 ## Time-Series Database
 
 TSDB records metric samples into a SQLite database stored under the plugin
-folder. The database lives in `metrics-tsdb/` as 64 KiB chunks, plus a
-`metrics.wal` recovery log. Each scrape batch is committed as a SQLite
-transaction, and retention pruning removes old samples on a schedule.
+folder. On desktop, the database lives in `metrics.sqlite` with SQLite's
+journal file beside it. On mobile or any adapter without direct filesystem
+access, TSDB uses `metrics-tsdb/` as 64 KiB chunk files. Both backends use the
+same SQLite schema and `metrics.wal` recovery log. Each scrape batch is
+committed as a SQLite transaction, and retention pruning removes old samples on
+a schedule.
 
 The local database is the center of the plugin:
 
@@ -354,7 +357,7 @@ tsdb/
 |   +-- types.ts             # Public metric API types
 |   +-- exporter/            # prom-client registry, public API, built-ins
 |   +-- scrape/              # Exposition parser and scrape scheduler
-|   +-- storage/             # wa-sqlite TSDB, chunked VFS, recovery WAL
+|   +-- storage/             # wa-sqlite TSDB, Node/chunk VFS, recovery WAL
 |   +-- promql/              # PromQL AST, parser, and engine
 |   +-- panels/              # Markdown panel config and rendering data
 |   +-- api/                 # HTTP server and /api/v1 routes

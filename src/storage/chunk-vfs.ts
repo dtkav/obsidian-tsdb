@@ -34,6 +34,14 @@ function sanitizeName(name: string): string {
 	return name.replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
+function metaPath(directory: string, name: string): string {
+	return `${directory}/${sanitizeName(name)}.meta`;
+}
+
+function chunkPath(directory: string, name: string, index: number): string {
+	return `${directory}/${sanitizeName(name)}.c${index}`;
+}
+
 /**
  * SQLite VFS backed by whole-file adapter I/O: each SQLite file (database,
  * journal) is stored as fixed-size chunk files plus a small JSON meta file,
@@ -56,11 +64,11 @@ export class AdapterChunkVFS extends VFS.Base {
 	}
 
 	private metaPath(name: string): string {
-		return `${this.directory}/${sanitizeName(name)}.meta`;
+		return metaPath(this.directory, name);
 	}
 
 	private chunkPath(name: string, index: number): string {
-		return `${this.directory}/${sanitizeName(name)}.c${index}`;
+		return chunkPath(this.directory, name, index);
 	}
 
 	private async ensureDir(): Promise<void> {
@@ -72,7 +80,6 @@ export class AdapterChunkVFS extends VFS.Base {
 	}
 
 	private async readMetaSize(name: string): Promise<number | null> {
-		if (!(await this.adapter.exists(this.metaPath(name)))) return null;
 		try {
 			const meta = JSON.parse(
 				await this.adapter.read(this.metaPath(name))
@@ -94,9 +101,12 @@ export class AdapterChunkVFS extends VFS.Base {
 		}
 		let chunk = new Uint8Array(CHUNK_SIZE);
 		const path = this.chunkPath(file.name, index);
-		if (await this.adapter.exists(path)) {
+		try {
 			const data = new Uint8Array(await this.adapter.readBinary(path));
 			chunk.set(data.subarray(0, Math.min(data.length, CHUNK_SIZE)));
+		} catch {
+			// Missing chunks read as zero-filled pages. SQLite will surface real
+			// corruption during schema/query operations if required bytes are gone.
 		}
 		file.chunks.set(index, chunk);
 		return chunk;
@@ -358,4 +368,28 @@ export async function migrateLegacySnapshot(
 	await adapter.write(metaPath, JSON.stringify({ size: bytes.length }));
 	await adapter.remove(legacyPath);
 	return true;
+}
+
+export async function readChunkedDatabaseImage(
+	adapter: ChunkAdapter,
+	directory: string,
+	dbName: string
+): Promise<Uint8Array | null> {
+	const dbMetaPath = metaPath(directory, dbName);
+	if (!(await adapter.exists(dbMetaPath))) return null;
+
+	const meta = JSON.parse(await adapter.read(dbMetaPath)) as { size?: unknown };
+	const size = typeof meta.size === "number" ? meta.size : 0;
+	const bytes = new Uint8Array(size);
+	const chunkCount = Math.ceil(size / CHUNK_SIZE);
+	for (let i = 0; i < chunkCount; i++) {
+		const path = chunkPath(directory, dbName, i);
+		if (!(await adapter.exists(path))) return null;
+		const chunk = new Uint8Array(await adapter.readBinary(path));
+		bytes.set(
+			chunk.subarray(0, Math.min(chunk.length, size - i * CHUNK_SIZE)),
+			i * CHUNK_SIZE
+		);
+	}
+	return bytes;
 }

@@ -1,4 +1,5 @@
 import type { ApiResultData } from "../promql/engine";
+import type { ApiHealthStatus } from "./server";
 import type { ScraperStatus } from "../scrape/scraper";
 import type { StoreStats } from "../storage/store";
 import type ObsidianMetricsPlugin from "../main";
@@ -28,6 +29,7 @@ export interface MetricsDebugInfo {
 export interface MetricsDebugGlobal {
 	__owner: unknown;
 	getInfo(): MetricsDebugInfo;
+	getHealth(): ApiHealthStatus;
 	getStats(): Promise<StoreStats | null>;
 	getScrapeStatuses(): ScraperStatus[];
 	/** Run an instant PromQL query against the local TSDB. */
@@ -72,6 +74,7 @@ export function installMetricsGlobal(
 				baseUrl: port !== null ? `http://localhost:${port}` : null,
 			};
 		},
+		getHealth: () => plugin.getHealthStatus(),
 		getStats: () => plugin.getTsdbStats(),
 		getScrapeStatuses: () => plugin.getScrapeStatuses(),
 		query: (expr, timeMs) =>

@@ -8,6 +8,7 @@ import {
 	compileMatchers,
 } from "../labels";
 import { AdapterChunkVFS, ChunkAdapter } from "./chunk-vfs";
+import { NodeFileVFS, deleteNodeDatabaseFiles } from "./node-file-vfs";
 
 export interface Point {
 	/** Unix milliseconds. */
@@ -38,21 +39,34 @@ export interface StoreStats {
 }
 
 export interface OpenOptions {
-	adapter: ChunkAdapter;
-	/** Folder holding the chunked database files. */
-	directory: string;
 	/** Embedded wasm binary; omitted in tests (loaded from disk). */
 	wasmBinary?: ArrayBuffer | Uint8Array;
 	dbName?: string;
+	location: StoreLocation;
 }
+
+export type StoreLocation =
+	| {
+			kind: "chunks";
+			adapter: ChunkAdapter;
+			/** Folder holding the chunked database files. */
+			directory: string;
+	  }
+	| {
+			kind: "node-file";
+			/** Folder holding the desktop metrics.sqlite file. */
+			directory: string;
+	  };
 
 interface CachedSeries {
 	id: number;
 	labels: Labels;
 }
 
-const VFS_NAME = "tsdb-chunks";
-const DEFAULT_DB_NAME = "metrics";
+const CHUNK_VFS_NAME = "tsdb-chunks";
+const NODE_FILE_VFS_NAME = "tsdb-node-file";
+export const DEFAULT_CHUNK_DB_NAME = "metrics";
+export const DEFAULT_NODE_DB_NAME = "metrics.sqlite";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
@@ -70,13 +84,15 @@ CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);
 `;
 
 /**
- * Time-series store on wa-sqlite (Asyncify build) over the chunked
- * vault-adapter VFS: every committed transaction is persisted incrementally
- * through SQLite's own journal — no whole-image snapshots, no Node APIs.
+ * Time-series store on wa-sqlite (Asyncify build) over either a desktop
+ * Node-backed SQLite file or the vault-adapter chunk VFS fallback.
  */
 export class MetricsStore {
 	private sqlite3: SQLiteAPI;
 	private db: number;
+	private closing = false;
+	private closed = false;
+	private closePromise: Promise<void> | null = null;
 
 	private seriesByKey = new Map<string, CachedSeries>();
 	private allSeries: CachedSeries[] = [];
@@ -90,6 +106,9 @@ export class MetricsStore {
 	private queue: Promise<unknown> = Promise.resolve();
 
 	private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.closing || this.closed) {
+			return Promise.reject(new Error("tsdb: metrics store is closing"));
+		}
 		const run = this.queue.then(fn, fn);
 		this.queue = run.then(
 			() => undefined,
@@ -103,21 +122,30 @@ export class MetricsStore {
 		this.db = db;
 	}
 
+	get isOpen(): boolean {
+		return !this.closing && !this.closed;
+	}
+
 	static async open(options: OpenOptions): Promise<MetricsStore> {
-		const dbName = options.dbName ?? DEFAULT_DB_NAME;
+		const dbName =
+			options.dbName ??
+			(options.location.kind === "node-file"
+				? DEFAULT_NODE_DB_NAME
+				: DEFAULT_CHUNK_DB_NAME);
 		const openOnce = async (): Promise<MetricsStore> => {
 			const module: unknown = await SQLiteAsyncESMFactory(
 				options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}
 			);
 			const sqlite3 = SQLite.Factory(module);
-			sqlite3.vfs_register(
-				new AdapterChunkVFS(VFS_NAME, options.adapter, options.directory),
-				false
-			);
+			const vfsName =
+				options.location.kind === "node-file"
+					? NODE_FILE_VFS_NAME
+					: CHUNK_VFS_NAME;
+			sqlite3.vfs_register(createVfs(vfsName, options.location), false);
 			const db = await sqlite3.open_v2(
 				dbName,
 				SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
-				VFS_NAME
+				vfsName
 			);
 			const store = new MetricsStore(sqlite3, db);
 			await store.init();
@@ -127,12 +155,12 @@ export class MetricsStore {
 		try {
 			return await openOnce();
 		} catch (error) {
-			// Unreadable/corrupt database: wipe the chunk files and start fresh.
+			// Unreadable/corrupt database: wipe the active backend and start fresh.
 			console.error(
 				"tsdb: stored database unreadable, starting fresh",
 				error
 			);
-			await wipeDatabaseFiles(options.adapter, options.directory, dbName);
+			await wipeDatabaseFiles(options.location, dbName);
 			return await openOnce();
 		}
 	}
@@ -404,17 +432,44 @@ export class MetricsStore {
 	}
 
 	close(): Promise<void> {
-		return this.enqueue(() => this.sqlite3.close(this.db).then(() => undefined));
+		if (this.closePromise) return this.closePromise;
+		this.closing = true;
+		this.closePromise = this.queue
+			.then(() => this.sqlite3.close(this.db))
+			.then(
+				() => {
+					this.closed = true;
+				},
+				(error) => {
+					this.closed = true;
+					throw error;
+				}
+			);
+		return this.closePromise;
 	}
 }
 
-/** Remove all chunk/meta files of a database (corruption recovery). */
+function createVfs(vfsName: string, location: StoreLocation) {
+	if (location.kind === "node-file") {
+		return new NodeFileVFS(vfsName, location.directory);
+	}
+	return new AdapterChunkVFS(vfsName, location.adapter, location.directory);
+}
+
+/** Remove files for the active database backend (corruption recovery). */
 export async function wipeDatabaseFiles(
-	adapter: ChunkAdapter,
-	directory: string,
+	location: StoreLocation,
 	dbName: string
 ): Promise<void> {
-	const vfs = new AdapterChunkVFS(VFS_NAME + "-wipe", adapter, directory);
+	if (location.kind === "node-file") {
+		await deleteNodeDatabaseFiles(location.directory, dbName);
+		return;
+	}
+	const vfs = new AdapterChunkVFS(
+		CHUNK_VFS_NAME + "-wipe",
+		location.adapter,
+		location.directory
+	);
 	for (const name of [dbName, `${dbName}-journal`]) {
 		try {
 			await vfs.deleteStoredFile(name);

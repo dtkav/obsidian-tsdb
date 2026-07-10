@@ -90,3 +90,46 @@ export interface UrlModule {
 	URL: typeof URL;
 	URLSearchParams: typeof URLSearchParams;
 }
+
+export interface NodeStats {
+	size: number;
+}
+
+export interface NodeFileHandle {
+	read(
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number
+	): Promise<{ bytesRead: number }>;
+	write(
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number
+	): Promise<{ bytesWritten: number }>;
+	truncate(size: number): Promise<void>;
+	sync(): Promise<void>;
+	stat(): Promise<NodeStats>;
+	close(): Promise<void>;
+}
+
+export interface NodeFsModule {
+	constants: {
+		O_RDONLY: number;
+		O_RDWR: number;
+		O_CREAT: number;
+		O_EXCL: number;
+	};
+	promises: {
+		mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+		open(path: string, flags: number, mode?: number): Promise<NodeFileHandle>;
+		stat(path: string): Promise<NodeStats>;
+		unlink(path: string): Promise<void>;
+		writeFile(path: string, data: Uint8Array): Promise<void>;
+	};
+}
+
+export interface NodePathModule {
+	join(...parts: string[]): string;
+}

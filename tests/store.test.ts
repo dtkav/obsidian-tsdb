@@ -1,11 +1,22 @@
-import { readFileSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { describe, expect, it } from "vitest";
 import {
 	CHUNK_SIZE,
 	ChunkAdapter,
 	migrateLegacySnapshot,
+	readChunkedDatabaseImage,
 } from "../src/storage/chunk-vfs";
-import { MetricsStore } from "../src/storage/store";
+import {
+	nodeStorageDirectoryForAdapter,
+	writeNodeFileDatabase,
+} from "../src/storage/node-file-vfs";
+import {
+	DEFAULT_CHUNK_DB_NAME,
+	DEFAULT_NODE_DB_NAME,
+	MetricsStore,
+} from "../src/storage/store";
 
 const WASM = readFileSync("node_modules/wa-sqlite/dist/wa-sqlite-async.wasm");
 const NAME = "__name__";
@@ -49,11 +60,23 @@ function makeAdapter(): FakeAdapter {
 
 async function openStore(adapter: FakeAdapter = makeAdapter()) {
 	const store = await MetricsStore.open({
-		adapter,
-		directory: "tsdb",
+		location: {
+			kind: "chunks",
+			adapter,
+			directory: "tsdb",
+		},
 		wasmBinary: WASM,
 	});
 	return { store, adapter };
+}
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+	const dir = mkdtempSync(join(tmpdir(), "tsdb-node-vfs-"));
+	try {
+		return await fn(dir);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
@@ -219,6 +242,15 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		await store.close();
 	});
 
+	it("rejects new operations after close begins", async () => {
+		const { store } = await openStore();
+		const closing = store.close();
+		await expect(
+			store.ingest([{ labels: { [NAME]: "late" }, ts: 1, value: 1 }])
+		).rejects.toThrow(/closing/);
+		await closing;
+	});
+
 	it("handles a multi-chunk database (spans chunk boundaries)", async () => {
 		const { store } = await openStore();
 		// ~200 series × 50 samples ≈ enough pages to cross 64 KiB chunks.
@@ -246,6 +278,106 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		);
 		expect(one[0].points).toHaveLength(50);
 		await store.close();
+	});
+});
+
+describe("MetricsStore (wa-sqlite over Node file VFS)", () => {
+	it("persists samples in a normal metrics.sqlite file", async () => {
+		await withTempDir(async (dir) => {
+			const first = await MetricsStore.open({
+				location: { kind: "node-file", directory: dir },
+				wasmBinary: WASM,
+			});
+			await first.ingest([
+				{ labels: { [NAME]: "node_metric" }, ts: 1234, value: 99 },
+			]);
+			await first.close();
+
+			expect(
+				readFileSync(join(dir, DEFAULT_NODE_DB_NAME)).byteLength
+			).toBeGreaterThan(0);
+
+			const second = await MetricsStore.open({
+				location: { kind: "node-file", directory: dir },
+				wasmBinary: WASM,
+			});
+			const data = await second.select(
+				[{ name: NAME, op: "=", value: "node_metric" }],
+				0,
+				9999
+			);
+			expect(data[0].points).toEqual([{ t: 1234, v: 99 }]);
+			await second.close();
+		});
+	});
+
+	it("can seed a Node sqlite file from existing chunk files", async () => {
+		await withTempDir(async (dir) => {
+			const adapter = makeAdapter();
+			const chunk = await openStore(adapter);
+			await chunk.store.ingest([
+				{ labels: { [NAME]: "chunk_metric" }, ts: 2000, value: 7 },
+			]);
+			await chunk.store.close();
+
+			const image = await readChunkedDatabaseImage(
+				adapter,
+				"tsdb",
+				DEFAULT_CHUNK_DB_NAME
+			);
+			expect(image).not.toBeNull();
+			await writeNodeFileDatabase(dir, DEFAULT_NODE_DB_NAME, image!);
+
+			const store = await MetricsStore.open({
+				location: { kind: "node-file", directory: dir },
+				wasmBinary: WASM,
+			});
+			const data = await store.select(
+				[{ name: NAME, op: "=", value: "chunk_metric" }],
+				0,
+				9999
+			);
+			expect(data[0].points).toEqual([{ t: 2000, v: 7 }]);
+			await store.close();
+		});
+	});
+});
+
+describe("storage backend selection", () => {
+	it("does not touch Node modules for mobile-style adapters", () => {
+		let attemptedNodeLoad = false;
+		const directory = nodeStorageDirectoryForAdapter({}, "tsdb", {
+			nodeFileBackendAvailable: () => {
+				attemptedNodeLoad = true;
+				throw new Error("node should not be loaded");
+			},
+			joinNodePath: () => {
+				throw new Error("node path should not be used");
+			},
+		});
+
+		expect(directory).toBeNull();
+		expect(attemptedNodeLoad).toBe(false);
+	});
+
+	it("uses the Node backend only for filesystem adapters when available", () => {
+		const directory = nodeStorageDirectoryForAdapter(
+			{ getBasePath: () => "/vault" },
+			".obsidian/plugins/tsdb",
+			{
+				nodeFileBackendAvailable: () => true,
+				joinNodePath: (...parts) => parts.join("/"),
+			}
+		);
+
+		expect(directory).toBe("/vault/.obsidian/plugins/tsdb");
+		expect(
+			nodeStorageDirectoryForAdapter(
+				{ getBasePath: () => "/vault" },
+				".obsidian/plugins/tsdb",
+				{ nodeFileBackendAvailable: () => false }
+			)
+		).toBeNull();
 	});
 });
 

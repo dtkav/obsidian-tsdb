@@ -1,17 +1,30 @@
 import * as http from "http";
 import { describe, expect, it } from "vitest";
 import {
+	ApiHealthStatus,
 	ApiServer,
 	parseStepParam,
 	parseTimeParam,
 } from "../src/api/server";
 
-function makeServer(): ApiServer {
+const HEALTHY: ApiHealthStatus = {
+	ok: true,
+	storeOpen: true,
+	queryEngineReady: true,
+	lastIngestMs: null,
+	lastIngestSampleCount: 0,
+	lastIngestError: null,
+	lastIngestErrorMs: null,
+	inFlightIngests: 0,
+};
+
+function makeServer(health: ApiHealthStatus = HEALTHY): ApiServer {
 	// Port binding doesn't touch engine/store; stub the deps.
 	return new ApiServer({
 		getExposition: async () => "",
 		engine: {} as any,
 		store: {} as any,
+		getHealth: () => health,
 		getMetricsPath: () => "/metrics",
 		pluginVersion: "test",
 	});
@@ -22,6 +35,31 @@ function occupy(port: number): Promise<http.Server> {
 		const server = http.createServer();
 		server.once("error", reject);
 		server.listen(port, "127.0.0.1", () => resolve(server));
+	});
+}
+
+function getJson(
+	port: number,
+	path: string
+): Promise<{ statusCode: number; body: any }> {
+	return new Promise((resolve, reject) => {
+		http
+			.get(`http://127.0.0.1:${port}${path}`, (res) => {
+				let raw = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk) => (raw += chunk));
+				res.on("end", () => {
+					try {
+						resolve({
+							statusCode: res.statusCode ?? 0,
+							body: raw ? JSON.parse(raw) : null,
+						});
+					} catch (error) {
+						reject(error);
+					}
+				});
+			})
+			.on("error", reject);
 	});
 }
 
@@ -58,6 +96,40 @@ describe("ApiServer.listenRange", () => {
 			expect(api.boundPort).toBe(null);
 		} finally {
 			for (const blocker of blockers) blocker.close();
+		}
+	});
+});
+
+describe("ApiServer health", () => {
+	it("returns ok while the store is writable", async () => {
+		const api = makeServer();
+		const port = await api.listenRange(19841, 19843);
+		try {
+			const response = await getJson(port, "/health");
+			expect(response.statusCode).toBe(200);
+			expect(response.body.status).toBe("ok");
+			expect(response.body.storeOpen).toBe(true);
+			expect(response.body.lastIngestError).toBe(null);
+		} finally {
+			await api.close();
+		}
+	});
+
+	it("returns unavailable when ingests are failing", async () => {
+		const api = makeServer({
+			...HEALTHY,
+			ok: false,
+			lastIngestError: "Error: database disk image is malformed",
+			lastIngestErrorMs: 1783657633000,
+		});
+		const port = await api.listenRange(19851, 19853);
+		try {
+			const response = await getJson(port, "/health");
+			expect(response.statusCode).toBe(503);
+			expect(response.body.status).toBe("error");
+			expect(response.body.lastIngestError).toContain("malformed");
+		} finally {
+			await api.close();
 		}
 	});
 });

@@ -25,3 +25,6 @@ metrics.db
 .DS_Store
 
 dist/
+
+# Local design notes and scratch specs.
+specs/
