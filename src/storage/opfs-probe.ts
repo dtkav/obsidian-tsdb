@@ -79,7 +79,7 @@ export async function probeOpfsWorker(options: {
 		const finish = (result: OpfsWorkerProbeResult) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timeout);
+			window.clearTimeout(timeout);
 			worker.removeEventListener("message", onMessage);
 			worker.terminate();
 			resolve(result);
@@ -92,7 +92,7 @@ export async function probeOpfsWorker(options: {
 				finish({ ok: false, error: event.data.error });
 			}
 		};
-		const timeout = setTimeout(() => {
+		const timeout = window.setTimeout(() => {
 			finish({ ok: false, error: "OPFS worker probe timed out" });
 		}, timeoutMs);
 

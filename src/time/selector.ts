@@ -71,7 +71,7 @@ export class TimeSelectorController {
 		this.statusEl.setAttr("aria-expanded", "false");
 		this.statusEl.setAttr("role", "button");
 		this.statusEl.tabIndex = 0;
-		this.statusEl.style.display = "none";
+		this.statusEl.setCssStyles({ display: "none" });
 
 		this.registerCapturedEvent("pointerdown", (event) =>
 			this.stopHeaderEvent(event)
@@ -148,7 +148,7 @@ export class TimeSelectorController {
 		if (refreshId !== this.refreshId) return;
 		this.visible = visible;
 		this.mount();
-		this.statusEl.style.display = visible ? "" : "none";
+		this.statusEl.setCssStyles({ display: visible ? "" : "none" });
 		if (!visible) this.closePopover();
 		this.render();
 	}
@@ -551,8 +551,10 @@ class TimeSelectorPopover {
 				? Math.max(margin, anchorRect.top - height - 6)
 				: below;
 
-		this.rootEl.style.left = `${Math.round(left)}px`;
-		this.rootEl.style.top = `${Math.round(top)}px`;
+		this.rootEl.setCssStyles({
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+		});
 	}
 }
 

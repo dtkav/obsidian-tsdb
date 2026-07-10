@@ -1140,7 +1140,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private updateStatusBar(): void {
 		if (!this.statusBarEl) return;
 		const port = this.boundPort;
-		this.statusBarEl.style.display = port !== null ? "" : "none";
+		this.statusBarEl.setCssStyles({ display: port !== null ? "" : "none" });
 		this.statusBarEl.textContent = port !== null ? `TSDB API: ${port}` : "";
 	}
 

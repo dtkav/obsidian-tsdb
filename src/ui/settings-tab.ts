@@ -816,7 +816,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 		const fill = progress.createDiv({ cls: "omx-storage-progress-fill" });
 		if (!knownTotal) return;
 		const pct = Math.min(100, Math.max(0, (imported / total) * 100));
-		fill.style.width = `${pct}%`;
+		fill.setCssStyles({ width: `${pct}%` });
 	}
 
 	// -- http api -----------------------------------------------------------------

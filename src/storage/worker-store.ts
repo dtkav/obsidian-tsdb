@@ -143,15 +143,15 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 				console.warn("tsdb: worker store close failed", error);
 			}
 		);
-		let timeoutId: ReturnType<typeof setTimeout> | null = null;
+		let timeoutId: number | null = null;
 		const timeout = new Promise<void>((resolve) => {
-			timeoutId = setTimeout(() => {
+			timeoutId = window.setTimeout(() => {
 				console.warn("tsdb: worker store close timed out; terminating worker");
 				resolve();
 			}, WORKER_STORE_CLOSE_TIMEOUT_MS);
 		});
 		this.closePromise = Promise.race([closeRequest, timeout]).then(() => {
-			if (timeoutId !== null) clearTimeout(timeoutId);
+			if (timeoutId !== null) window.clearTimeout(timeoutId);
 			this.forceClose(new Error("tsdb: worker store closed"));
 		});
 		return this.closePromise;
@@ -166,7 +166,7 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 			return Promise.reject(new Error("tsdb: worker store is closing"));
 		}
 		const id = this.nextRequestId++;
-		const message = { id, ...body } as WorkerStoreRequest;
+		const message: WorkerStoreRequest = { id, ...body };
 		return new Promise<T>((resolve, reject) => {
 			this.pending.set(id, {
 				resolve: (value) => resolve(value as T),

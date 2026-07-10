@@ -362,9 +362,13 @@ export async function deleteNodeDatabaseFiles(
 	directory: string,
 	dbName: string
 ): Promise<void> {
-	const vfs = new NodeFileVFS("tsdb-node-file-wipe", directory);
+	const { fs, path } = loadNodeFileModules();
 	for (const name of [dbName, `${dbName}-journal`, `${dbName}-wal`, `${dbName}-shm`]) {
-		await vfs.xDelete(name, 0);
+		try {
+			await fs.promises.unlink(path.join(directory, sanitizeName(name)));
+		} catch (error) {
+			if (!isMissingFile(error)) throw error;
+		}
 	}
 }
 
