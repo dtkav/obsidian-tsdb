@@ -44,6 +44,7 @@ external endpoint scraping are available under advanced settings.
    ```bash
    cd obsidian-tsdb
    npm install
+   npm run build:tsdb-wasm
    npm run build
    ```
 
@@ -373,10 +374,15 @@ tsdb/
 
 ```bash
 npm install
+npm run build:tsdb-wasm
 npm run build
 npm run dev
 npm test
 ```
+
+The Wasm build uses Docker, pins Emscripten and the wa-sqlite source revision,
+and installs the generated `.mjs`/`.wasm` pair into `node_modules`. Normal
+builds verify that this custom artifact is present before bundling.
 
 Release checks:
 

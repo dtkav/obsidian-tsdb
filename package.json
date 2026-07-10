@@ -5,9 +5,11 @@
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
+		"build:tsdb-wasm": "bash scripts/build-tsdb-wasm.sh",
+		"check:tsdb-wasm": "node scripts/verify-tsdb-wasm.mjs",
 		"check": "tsc -noEmit -skipLibCheck",
 		"check:no-node": "tsc -noEmit -skipLibCheck -p tsconfig.no-node.json",
-		"build": "npm run check && node esbuild.config.mjs production",
+		"build": "npm run check:tsdb-wasm && npm run check && node esbuild.config.mjs production",
 		"verify-release": "node scripts/verify-release.mjs",
 		"release": "npm run build && npm run test --if-present && npm run verify-release",
 		"test": "vitest run",

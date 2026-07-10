@@ -1,0 +1,31 @@
+{
+  "series": 250,
+  "points_per_series": 2880,
+  "sample_count": 720000,
+  "row": {
+    "ingest_seconds": 22.424650359898806,
+    "query_median_seconds": 0.03578506177291274,
+    "packed_query_median_seconds": 0.018396851141005754,
+    "packed_query_bytes": 148079,
+    "retention_seconds": 0.6951206340454519,
+    "file_bytes": 22319104,
+    "used_bytes": 22319104
+  },
+  "tsdb": {
+    "ingest_seconds": 32.48890385217965,
+    "compact_seconds": 2.2309853830374777,
+    "query_median_seconds": 0.04921881901100278,
+    "packed_query_median_seconds": 0.023932822048664093,
+    "packed_query_bytes": 148079,
+    "retention_seconds": 0.13476144382730126,
+    "file_bytes": 6844416,
+    "used_bytes": 6844416
+  },
+  "ratios": {
+    "ingest_tsdb_over_row": 1.4488031398820997,
+    "query_tsdb_over_row": 1.3754012588643518,
+    "packed_query_tsdb_over_row": 1.3009194815583907,
+    "retention_tsdb_over_row": 0.1938677075992102,
+    "storage_tsdb_over_row": 0.3066617728023491
+  }
+}

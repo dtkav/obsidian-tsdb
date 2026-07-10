@@ -40,6 +40,7 @@ jobs:
           node-version: "24.x"
           cache: npm
       - run: npm ci
+      - run: npm run build:tsdb-wasm
       - run: npm run release
       - name: Generate artifact attestations
         uses: actions/attest@v4

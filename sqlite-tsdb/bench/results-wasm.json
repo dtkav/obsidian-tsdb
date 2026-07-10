@@ -1,0 +1,32 @@
+{
+  "runtime": { "node": "v24.17.0", "wasmBytes": 1133534 },
+  "workload": {
+    "seriesCount": 50,
+    "pointsPerSeries": 720,
+    "samples": 36000,
+    "stepMs": 30000
+  },
+  "baseline": {
+    "ingestMs": 1318.252199,
+    "queryMs": 24.90150399999993,
+    "retentionMs": 131.72439999999983,
+    "selectedRows": 3600,
+    "sizeBytes": 1466368
+  },
+  "tsdb": {
+    "ingestMs": 697.0144480000001,
+    "compactMs": 561.604241,
+    "queryMs": 49.820516000000225,
+    "packedQueryMs": 15.701097000000118,
+    "retentionMs": 59.855287999999746,
+    "selectedRows": 3600,
+    "packedSeries": 10,
+    "sizeBytes": 1495040
+  },
+  "ratios": {
+    "ingest": 0.5287413505008689,
+    "query": 2.0007030900623657,
+    "retention": 0.4543978792084065,
+    "size": 1.0195530726256983
+  }
+}
