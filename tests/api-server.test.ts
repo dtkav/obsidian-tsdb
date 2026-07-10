@@ -11,6 +11,7 @@ const HEALTHY: ApiHealthStatus = {
 	ok: true,
 	store: {
 		open: true,
+		backend: "node-file",
 	},
 	queryEngine: {
 		ready: true,

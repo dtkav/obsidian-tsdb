@@ -375,11 +375,8 @@ export async function readChunkedDatabaseImage(
 	directory: string,
 	dbName: string
 ): Promise<Uint8Array | null> {
-	const dbMetaPath = metaPath(directory, dbName);
-	if (!(await adapter.exists(dbMetaPath))) return null;
-
-	const meta = JSON.parse(await adapter.read(dbMetaPath)) as { size?: unknown };
-	const size = typeof meta.size === "number" ? meta.size : 0;
+	const size = await readChunkedDatabaseImageSize(adapter, directory, dbName);
+	if (size === null) return null;
 	const bytes = new Uint8Array(size);
 	const chunkCount = Math.ceil(size / CHUNK_SIZE);
 	for (let i = 0; i < chunkCount; i++) {
@@ -392,4 +389,19 @@ export async function readChunkedDatabaseImage(
 		);
 	}
 	return bytes;
+}
+
+export async function readChunkedDatabaseImageSize(
+	adapter: ChunkAdapter,
+	directory: string,
+	dbName: string
+): Promise<number | null> {
+	const dbMetaPath = metaPath(directory, dbName);
+	if (!(await adapter.exists(dbMetaPath))) return null;
+
+	const meta = JSON.parse(await adapter.read(dbMetaPath)) as { size?: unknown };
+	const size = meta.size;
+	return typeof size === "number" && Number.isFinite(size) && size > 0
+		? size
+		: 0;
 }

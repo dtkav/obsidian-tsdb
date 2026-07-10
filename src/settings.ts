@@ -35,6 +35,17 @@ export interface StorageSettings {
 	retentionDays: number;
 	/** How often the in-memory SQLite image is flushed to disk. */
 	flushIntervalSeconds: number;
+	/**
+	 * Prefer the worker-backed OPFS store when the runtime supports it.
+	 * Advanced data.json override; not shown in the settings UI.
+	 */
+	workerBackend: boolean;
+	/**
+	 * Permit desktop SQLite or vault chunk storage when worker OPFS cannot start.
+	 * Off by default so OPFS failures are visible instead of silently switching
+	 * engines.
+	 */
+	allowLegacyBackends: boolean;
 }
 
 export interface ObsidianMetricsSettings {
@@ -63,6 +74,8 @@ export const DEFAULT_SETTINGS: ObsidianMetricsSettings = {
 	storage: {
 		retentionDays: 30,
 		flushIntervalSeconds: 300,
+		workerBackend: true,
+		allowLegacyBackends: false,
 	},
 	onboarded: false,
 };

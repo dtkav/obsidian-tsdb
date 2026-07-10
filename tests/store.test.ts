@@ -3,6 +3,13 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
 import {
+	LEGACY_DB_FILENAME,
+	TSDB_DIRNAME,
+	findLegacyStorageMigrationSource,
+	prepareWorkerOpfsOpenPlan,
+	prepareStoreOpenPlan,
+} from "../src/storage/backend";
+import {
 	CHUNK_SIZE,
 	ChunkAdapter,
 	migrateLegacySnapshot,
@@ -10,6 +17,7 @@ import {
 } from "../src/storage/chunk-vfs";
 import {
 	nodeStorageDirectoryForAdapter,
+	readNodeFileDatabase,
 	writeNodeFileDatabase,
 } from "../src/storage/node-file-vfs";
 import {
@@ -331,6 +339,35 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		});
 		await store.close();
 	});
+
+	it("streams all samples in export batches", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "exported", series: "a" }, ts: 1000, value: 1 },
+			{ labels: { [NAME]: "exported", series: "a" }, ts: 2000, value: 2 },
+			{ labels: { [NAME]: "exported", series: "b" }, ts: 1500, value: 3 },
+		]);
+		const batches: Array<Array<{ ts: number; value: number }>> = [];
+		const result = await store.exportSamples({
+			batchSize: 2,
+			onBatch: async (samples) => {
+				batches.push(samples.map((sample) => ({
+					ts: sample.ts,
+					value: sample.value,
+				})));
+			},
+		});
+
+		expect(result).toEqual({ samples: 3, batches: 2 });
+		expect(batches).toEqual([
+			[
+				{ ts: 1000, value: 1 },
+				{ ts: 2000, value: 2 },
+			],
+			[{ ts: 1500, value: 3 }],
+		]);
+		await store.close();
+	});
 });
 
 describe("MetricsStore (wa-sqlite over Node file VFS)", () => {
@@ -431,6 +468,255 @@ describe("storage backend selection", () => {
 				{ nodeFileBackendAvailable: () => false }
 			)
 		).toBeNull();
+	});
+
+	it("plans chunk storage for mobile-style adapters and migrates legacy snapshots", async () => {
+		const adapter = makeAdapter();
+		const legacy = new Uint8Array(CHUNK_SIZE + 7);
+		legacy.fill(0x42);
+		adapter.files.set(
+			`plugin/${LEGACY_DB_FILENAME}`,
+			legacy.buffer.slice(0)
+		);
+
+		const plan = await prepareStoreOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			wasmBinary: WASM,
+		});
+
+		expect(plan.backend).toBe("chunks");
+		expect(plan.location).toEqual({
+			kind: "chunks",
+			adapter,
+			directory: `plugin/${TSDB_DIRNAME}`,
+		});
+		expect(adapter.files.has(`plugin/${LEGACY_DB_FILENAME}`)).toBe(false);
+		expect(
+			JSON.parse(
+				adapter.files.get(`plugin/${TSDB_DIRNAME}/metrics.meta`) as string
+			)
+		).toEqual({ size: legacy.byteLength });
+	});
+
+	it("plans node-file storage for desktop filesystem adapters", async () => {
+		await withTempDir(async (dir) => {
+			const adapter = Object.assign(makeAdapter(), {
+				getBasePath: () => dir,
+			});
+
+			const plan = await prepareStoreOpenPlan({
+				adapter,
+				pluginDir: ".obsidian/plugins/tsdb",
+				wasmBinary: WASM,
+			});
+
+			expect(plan.backend).toBe("node-file");
+			expect(plan.dbName).toBe(DEFAULT_NODE_DB_NAME);
+			expect(plan.location).toEqual({
+				kind: "node-file",
+				directory: join(dir, ".obsidian/plugins/tsdb"),
+			});
+		});
+	});
+
+	it("finds a desktop sqlite migration source", async () => {
+		await withTempDir(async (dir) => {
+			const adapter = Object.assign(makeAdapter(), {
+				getBasePath: () => dir,
+			});
+			const nodeDirectory = join(dir, ".obsidian/plugins/tsdb");
+			const seed = new Uint8Array([1, 2, 3, 4]);
+			await writeNodeFileDatabase(nodeDirectory, DEFAULT_NODE_DB_NAME, seed);
+
+			const source = await findLegacyStorageMigrationSource({
+				adapter,
+				pluginDir: ".obsidian/plugins/tsdb",
+			});
+
+			expect(source).toMatchObject({
+				backend: "node-file",
+				label: "desktop SQLite",
+				dbName: DEFAULT_NODE_DB_NAME,
+				sizeBytes: seed.byteLength,
+			});
+		});
+	});
+
+	it("finds a chunked migration source on mobile-style adapters", async () => {
+		const adapter = makeAdapter();
+		adapter.files.set(
+			`plugin/${TSDB_DIRNAME}/${DEFAULT_CHUNK_DB_NAME}.meta`,
+			JSON.stringify({ size: 1234 })
+		);
+
+		const source = await findLegacyStorageMigrationSource({
+			adapter,
+			pluginDir: "plugin",
+		});
+
+		expect(source).toMatchObject({
+			backend: "chunks",
+			label: "vault chunks",
+			dbName: DEFAULT_CHUNK_DB_NAME,
+			sizeBytes: 1234,
+		});
+	});
+
+	it("skips OPFS worker planning when the worker probe fails", async () => {
+		const adapter = makeAdapter();
+
+		const plan = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			probe: async () => ({ ok: false, error: "no sync handles" }),
+		});
+
+		expect(plan).toBeNull();
+	});
+
+	it("plans OPFS worker storage without raw-seeding desktop sqlite", async () => {
+		await withTempDir(async (dir) => {
+			const adapter = Object.assign(makeAdapter(), {
+				getBasePath: () => dir,
+			});
+			const nodeDirectory = join(dir, ".obsidian/plugins/tsdb");
+			const seed = new Uint8Array([1, 2, 3, 4]);
+			await writeNodeFileDatabase(nodeDirectory, DEFAULT_NODE_DB_NAME, seed);
+
+			const plan = await prepareWorkerOpfsOpenPlan({
+				adapter,
+				pluginDir: ".obsidian/plugins/tsdb",
+				probe: async () => ({ ok: true }),
+			});
+
+			expect(plan?.backend).toBe("worker-opfs");
+			expect(plan?.dbName).toBe("tsdb/metrics.sqlite");
+			expect(
+				await readNodeFileDatabase(nodeDirectory, DEFAULT_NODE_DB_NAME)
+			).toEqual(seed);
+		});
+	});
+
+	it("leaves desktop sqlite untouched while planning OPFS", async () => {
+		await withTempDir(async (dir) => {
+			const adapter = Object.assign(makeAdapter(), {
+				getBasePath: () => dir,
+			});
+			const nodeDirectory = join(dir, ".obsidian/plugins/tsdb");
+			const seed = new Uint8Array([1, 2, 3, 4]);
+			await writeNodeFileDatabase(nodeDirectory, DEFAULT_NODE_DB_NAME, seed);
+
+			const plan = await prepareWorkerOpfsOpenPlan({
+				adapter,
+				pluginDir: ".obsidian/plugins/tsdb",
+				probe: async () => ({ ok: true }),
+			});
+
+			expect(plan?.backend).toBe("worker-opfs");
+			expect(
+				await readNodeFileDatabase(nodeDirectory, DEFAULT_NODE_DB_NAME)
+			).toEqual(seed);
+		});
+	});
+
+	it("namespaces OPFS worker storage by vault identity", async () => {
+		const adapter = makeAdapter();
+		const live1 = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			namespace: "/vaults/live1",
+			probe: async () => ({ ok: true }),
+		});
+		const live2 = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			namespace: "/vaults/live2",
+			probe: async () => ({ ok: true }),
+		});
+
+		expect(live1?.backend).toBe("worker-opfs");
+		expect(live2?.backend).toBe("worker-opfs");
+		expect(live1?.dbName).not.toBe(live2?.dbName);
+		expect(live1?.dbName).toMatch(/^plugin-[a-z0-9]+\/metrics\.sqlite$/);
+		expect(live2?.dbName).toMatch(/^plugin-[a-z0-9]+\/metrics\.sqlite$/);
+	});
+
+	it("plans OPFS worker storage without raw-seeding chunked data", async () => {
+		const adapter = makeAdapter();
+		const chunkStore = await MetricsStore.open({
+			location: {
+				kind: "chunks",
+				adapter,
+				directory: `plugin/${TSDB_DIRNAME}`,
+			},
+			wasmBinary: WASM,
+		});
+		await chunkStore.ingest([
+			{ labels: { [NAME]: "chunk_seed" }, ts: 3000, value: 11 },
+		]);
+		await chunkStore.close();
+
+		const plan = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			probe: async () => ({ ok: true }),
+		});
+
+		expect(plan?.backend).toBe("worker-opfs");
+		expect(plan?.dbName).toBe("plugin/metrics.sqlite");
+		expect(
+			await findLegacyStorageMigrationSource({
+				adapter,
+				pluginDir: "plugin",
+			})
+		).toMatchObject({ backend: "chunks", label: "vault chunks" });
+	});
+
+	it("leaves chunked data untouched while planning OPFS", async () => {
+		const adapter = makeAdapter();
+		adapter.files.set(
+			`plugin/${TSDB_DIRNAME}/${DEFAULT_CHUNK_DB_NAME}.meta`,
+			JSON.stringify({ size: 4 })
+		);
+		adapter.files.set(
+			`plugin/${TSDB_DIRNAME}/${DEFAULT_CHUNK_DB_NAME}.c0`,
+			new Uint8Array([1, 2, 3, 4]).buffer
+		);
+
+		const plan = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			probe: async () => ({ ok: true }),
+		});
+
+		expect(plan?.backend).toBe("worker-opfs");
+		expect(adapter.files.has(
+			`plugin/${TSDB_DIRNAME}/${DEFAULT_CHUNK_DB_NAME}.meta`
+		)).toBe(true);
+		expect(adapter.files.has(
+			`plugin/${TSDB_DIRNAME}/${DEFAULT_CHUNK_DB_NAME}.c0`
+		)).toBe(true);
+	});
+
+	it("plans OPFS worker storage without raw-seeding a legacy snapshot", async () => {
+		const adapter = makeAdapter();
+		const legacy = new Uint8Array(CHUNK_SIZE + 17);
+		legacy.fill(0x7d);
+		adapter.files.set(
+			`plugin/${LEGACY_DB_FILENAME}`,
+			legacy.buffer.slice(0)
+		);
+
+		const plan = await prepareWorkerOpfsOpenPlan({
+			adapter,
+			pluginDir: "plugin",
+			probe: async () => ({ ok: true }),
+		});
+
+		expect(plan?.backend).toBe("worker-opfs");
+		expect(plan?.dbName).toBe("plugin/metrics.sqlite");
+		expect(adapter.files.has(`plugin/${LEGACY_DB_FILENAME}`)).toBe(true);
 	});
 });
 

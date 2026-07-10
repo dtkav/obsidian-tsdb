@@ -11,6 +11,40 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
+const workerSourcePlugin = {
+	name: "tsdb-worker-source",
+	setup(build) {
+		build.onResolve({ filter: /^tsdb-worker-source$/ }, (args) => ({
+			path: args.path,
+			namespace: "tsdb-worker-source",
+		}));
+		build.onLoad({ filter: /.*/, namespace: "tsdb-worker-source" }, async () => {
+			const result = await esbuild.build({
+				entryPoints: ["src/storage/tsdb-worker.ts"],
+				bundle: true,
+				write: false,
+				format: "iife",
+				target: "es2020",
+				platform: "browser",
+				define: {
+					"process.env.NODE_ENV": prod ? '"production"' : '"development"',
+					"import.meta.url": '"file:///tsdb/worker.js"',
+				},
+				logLevel: "silent",
+				minify: prod,
+				treeShaking: true,
+				metafile: true,
+			});
+			const source = result.outputFiles[0].text;
+			return {
+				contents: `export default ${JSON.stringify(source)};`,
+				loader: "js",
+				watchFiles: Object.keys(result.metafile.inputs),
+			};
+		});
+	},
+};
+
 const context = await esbuild.context({
 	banner: {
 		js: banner,
@@ -55,6 +89,7 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [workerSourcePlugin],
 });
 
 if (prod) {

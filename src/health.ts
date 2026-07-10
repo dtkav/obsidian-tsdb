@@ -32,6 +32,7 @@ export interface ApiHealthStatus {
 	ok: boolean;
 	store: {
 		open: boolean;
+		backend: "worker-opfs" | "node-file" | "chunks" | "unknown";
 	};
 	queryEngine: {
 		ready: boolean;

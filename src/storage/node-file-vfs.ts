@@ -314,12 +314,21 @@ export async function nodeFileExists(
 	directory: string,
 	dbName: string
 ): Promise<boolean> {
+	return (await nodeFileSize(directory, dbName)) !== null;
+}
+
+export async function nodeFileSize(
+	directory: string,
+	dbName: string
+): Promise<number | null> {
 	const { fs, path } = loadNodeFileModules();
 	try {
-		await fs.promises.stat(path.join(directory, sanitizeName(dbName)));
-		return true;
+		const stats = await fs.promises.stat(
+			path.join(directory, sanitizeName(dbName))
+		);
+		return stats.size;
 	} catch (error) {
-		if (isMissingFile(error)) return false;
+		if (isMissingFile(error)) return null;
 		throw error;
 	}
 }
@@ -332,6 +341,21 @@ export async function writeNodeFileDatabase(
 	const { fs, path } = loadNodeFileModules();
 	await fs.promises.mkdir(directory, { recursive: true });
 	await fs.promises.writeFile(path.join(directory, sanitizeName(dbName)), bytes);
+}
+
+export async function readNodeFileDatabase(
+	directory: string,
+	dbName: string
+): Promise<Uint8Array | null> {
+	const { fs, path } = loadNodeFileModules();
+	try {
+		return new Uint8Array(
+			await fs.promises.readFile(path.join(directory, sanitizeName(dbName)))
+		);
+	} catch (error) {
+		if (isMissingFile(error)) return null;
+		throw error;
+	}
 }
 
 export async function deleteNodeDatabaseFiles(

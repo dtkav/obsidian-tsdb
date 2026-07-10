@@ -1,6 +1,7 @@
 import {
 	App,
 	Modal,
+	Notice,
 	PluginSettingTab,
 	Setting,
 	SettingGroup,
@@ -9,6 +10,7 @@ import {
 } from "obsidian";
 import uPlot from "uplot";
 import type ObsidianMetricsPlugin from "../main";
+import type { StorageMigrationCandidate } from "../main";
 import { alignMatrix, formatUnitValue } from "../panels/data";
 import { ScrapeJobSettings } from "../settings";
 import { openMetricsDashboard } from "./demo-dashboard";
@@ -19,6 +21,9 @@ export class MetricsSettingTab extends PluginSettingTab {
 	private sparklineRenderId = 0;
 	private visible = false;
 	private scrapeRefreshScheduled = false;
+	private migrationRefreshScheduled = false;
+	private storageMigrationEl: HTMLElement | null = null;
+	private migrationRenderId = 0;
 
 	constructor(app: App, plugin: ObsidianMetricsPlugin) {
 		super(app, plugin);
@@ -42,6 +47,8 @@ export class MetricsSettingTab extends PluginSettingTab {
 	hide(): void {
 		this.visible = false;
 		this.sparklineRenderId++;
+		this.migrationRenderId++;
+		this.storageMigrationEl = null;
 		this.destroySparkline();
 	}
 
@@ -55,6 +62,25 @@ export class MetricsSettingTab extends PluginSettingTab {
 			if (this.hasFocusedField()) return;
 			this.display();
 		}, 250);
+	}
+
+	onStorageMigrationChanged(): void {
+		if (!this.visible || this.migrationRefreshScheduled) return;
+		this.migrationRefreshScheduled = true;
+		window.setTimeout(() => {
+			this.migrationRefreshScheduled = false;
+			if (!this.visible || !this.containerEl.isConnected) return;
+			this.refreshStorageMigration();
+		}, 500);
+	}
+
+	private refreshStorageMigration(): void {
+		const migrationEl = this.storageMigrationEl;
+		if (!migrationEl?.isConnected) {
+			this.display();
+			return;
+		}
+		void this.renderStorageMigration(migrationEl);
 	}
 
 	private hasFocusedField(): boolean {
@@ -108,6 +134,23 @@ export class MetricsSettingTab extends PluginSettingTab {
 		return `${words.charAt(0).toUpperCase()}${words.slice(1)} metrics`;
 	}
 
+	private storageBackendLabel(
+		backend: ReturnType<
+			ObsidianMetricsPlugin["getHealthStatus"]
+		>["store"]["backend"]
+	): string {
+		switch (backend) {
+			case "worker-opfs":
+				return "worker OPFS";
+			case "node-file":
+				return "desktop SQLite";
+			case "chunks":
+				return "vault chunks";
+			default:
+				return "unknown";
+		}
+	}
+
 	// -- status header ----------------------------------------------------------
 
 	private displayStatusHeader(
@@ -159,7 +202,10 @@ export class MetricsSettingTab extends PluginSettingTab {
 					? "sample count pending"
 					: `${stats.sampleCount.toLocaleString()} samples`,
 			];
+			const migrationRunning =
+				this.plugin.getStorageMigrationStatus().state === "running";
 			if (
+				!migrationRunning &&
 				stats.samplesLastHour !== null &&
 				stats.sampleCount !== null &&
 				stats.samplesLastHour > 0 &&
@@ -169,7 +215,9 @@ export class MetricsSettingTab extends PluginSettingTab {
 					(stats.sizeBytes / stats.sampleCount) * stats.samplesLastHour * 24;
 				parts.push(`growing ≈${formatUnitValue(bytesPerDay, "bytes")}/day`);
 			}
-			dbLine.setText(`SQLite database — ${parts.join(" · ")}`);
+			dbLine.setText(
+				`Database (${this.storageBackendLabel(health.store.backend)}) — ${parts.join(" · ")}`
+			);
 		});
 
 		this.displayHealthSummary(main, health);
@@ -196,7 +244,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 		if (health.ok) {
 			rows.createDiv({
 				cls: "omx-settings-health-row is-ok",
-				text: "Recording, storage, and queries are healthy.",
+				text: `Recording, storage, and queries are healthy. Storage: ${this.storageBackendLabel(health.store.backend)}.`,
 			});
 			return;
 		}
@@ -640,7 +688,7 @@ export class MetricsSettingTab extends PluginSettingTab {
 			.setHeading("Database");
 		this.hint(
 			group,
-			"History is kept in a SQLite database inside this vault's plugin folder."
+			"History is kept in a worker-backed SQLite database in Obsidian browser storage."
 		);
 
 		group.addSetting((setting) => {
@@ -660,6 +708,115 @@ export class MetricsSettingTab extends PluginSettingTab {
 						})
 				);
 		});
+
+		group.addSetting((setting) => {
+			setting
+				.setName("Allow desktop/chunk database engines")
+				.setDesc(
+					"Use desktop SQLite or vault chunks only when OPFS cannot start."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.storage.allowLegacyBackends)
+						.onChange(async (value) => {
+							this.plugin.settings.storage.allowLegacyBackends = value;
+							await this.plugin.saveSettings();
+						})
+				);
+		});
+
+		const migrationEl = group.listEl.createDiv({
+			cls: "omx-storage-migration",
+		});
+		this.storageMigrationEl = migrationEl;
+		void this.renderStorageMigration(migrationEl);
+	}
+
+	private async renderStorageMigration(parent: HTMLElement): Promise<void> {
+		const renderId = ++this.migrationRenderId;
+		parent.empty();
+		const status = this.plugin.getStorageMigrationStatus();
+		const header = parent.createDiv({ cls: "omx-storage-migration-header" });
+		header.createDiv({
+			cls: "omx-storage-migration-title",
+			text: "OPFS migration",
+		});
+
+		if (status.state === "running") {
+			const total = status.totalSamples;
+			const imported = status.importedSamples;
+			const desc =
+				total !== null && total > 0
+					? `${imported.toLocaleString()} of ${total.toLocaleString()} samples imported from ${status.sourceLabel}.`
+					: `${imported.toLocaleString()} samples imported from ${status.sourceLabel ?? "storage source"}.`;
+			parent.createDiv({ cls: "omx-storage-migration-desc", text: desc });
+			this.createMigrationProgress(parent, imported, total);
+			return;
+		}
+
+		if (status.state === "done") {
+			parent.createDiv({
+				cls: "omx-storage-migration-desc",
+				text: `${status.importedSamples.toLocaleString()} samples imported from ${status.sourceLabel}.`,
+			});
+		} else if (status.state === "error") {
+			parent.createDiv({
+				cls: "omx-storage-migration-desc is-error",
+				text: status.error ?? "Migration failed.",
+			});
+		}
+
+		const body = parent.createDiv({ cls: "omx-storage-migration-body" });
+		const activeBackend = this.plugin.getHealthStatus().store.backend;
+		if (activeBackend !== "worker-opfs") {
+			body.createDiv({
+				cls: "omx-storage-migration-desc",
+				text:
+					`OPFS migration is unavailable because the active database backend is ` +
+					`${this.storageBackendLabel(activeBackend)}.`,
+			});
+			return;
+		}
+
+		const candidate = await this.plugin.getStorageMigrationCandidate();
+		if (!parent.isConnected || renderId !== this.migrationRenderId) return;
+
+		if (!candidate) {
+			body.createDiv({
+				cls: "omx-storage-migration-desc",
+				text: "No importable desktop SQLite or chunked database found.",
+			});
+			return;
+		}
+
+		body.createDiv({
+			cls: "omx-storage-migration-desc",
+			text: `${candidate.label} found (${formatUnitValue(candidate.sizeBytes, "bytes")}). Import its samples into the active OPFS database.`,
+		});
+		const button = body.createEl("button", {
+			cls: "mod-cta",
+			text: status.state === "done" ? "Import again" : "Migrate into OPFS",
+		});
+		button.onclick = () => {
+			new StorageMigrationModal(this.app, this.plugin, candidate, () =>
+				this.refreshStorageMigration()
+			).open();
+		};
+	}
+
+	private createMigrationProgress(
+		parent: HTMLElement,
+		imported: number,
+		total: number | null
+	): void {
+		const knownTotal = total !== null && total > 0;
+		const progress = parent.createDiv({
+			cls: `omx-storage-progress${knownTotal ? "" : " is-indeterminate"}`,
+		});
+		const fill = progress.createDiv({ cls: "omx-storage-progress-fill" });
+		if (!knownTotal) return;
+		const pct = Math.min(100, Math.max(0, (imported / total) * 100));
+		fill.style.width = `${pct}%`;
 	}
 
 	// -- http api -----------------------------------------------------------------
@@ -888,5 +1045,52 @@ class AddScrapeTargetModal extends Modal {
 		this.plugin.restartScraper();
 		this.close();
 		this.onSaved();
+	}
+}
+
+class StorageMigrationModal extends Modal {
+	constructor(
+		app: App,
+		private plugin: ObsidianMetricsPlugin,
+		private candidate: StorageMigrationCandidate,
+		private onStarted: () => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("Migrate history into OPFS");
+		this.contentEl.empty();
+		this.contentEl.addClass("omx-storage-migration-modal");
+		this.contentEl.createDiv({
+			text:
+				`This imports samples from ${this.candidate.label} ` +
+				`(${formatUnitValue(this.candidate.sizeBytes, "bytes")}) into the active OPFS database. Existing OPFS samples are kept.`,
+		});
+
+		const actions = this.contentEl.createDiv({ cls: "omx-modal-actions" });
+		const cancel = actions.createEl("button", { text: "Cancel" });
+		cancel.onclick = () => this.close();
+		const start = actions.createEl("button", {
+			cls: "mod-cta",
+			text: "Start migration",
+		});
+		start.onclick = () => {
+			start.disabled = true;
+			void this.plugin.migrateLegacyStorageToOpfs().catch((error) => {
+				new Notice(
+					`TSDB migration failed: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+					8000
+				);
+			});
+			this.close();
+			this.onStarted();
+		};
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

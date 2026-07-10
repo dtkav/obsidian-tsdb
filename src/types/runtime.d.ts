@@ -124,6 +124,7 @@ export interface NodeFsModule {
 	promises: {
 		mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
 		open(path: string, flags: number, mode?: number): Promise<NodeFileHandle>;
+		readFile(path: string): Promise<Uint8Array>;
 		stat(path: string): Promise<NodeStats>;
 		unlink(path: string): Promise<void>;
 		writeFile(path: string, data: Uint8Array): Promise<void>;

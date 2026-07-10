@@ -1,4 +1,4 @@
-import { MetricsStore } from "./store";
+import { MetricsStoreLike } from "./store";
 import { SampleWal, WalReplayResult } from "./wal";
 
 export type StartupWalMaintenanceResult =
@@ -17,7 +17,7 @@ export interface StartupWalMaintenanceOptions {
 
 export async function maintainStartupWal(
 	wal: SampleWal,
-	store: MetricsStore,
+	store: MetricsStoreLike,
 	options: StartupWalMaintenanceOptions = {}
 ): Promise<StartupWalMaintenanceResult> {
 	if (!store.recoveredFromCorruption) {

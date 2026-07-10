@@ -1,6 +1,7 @@
 import { MarkdownView, Notice, Plugin } from "obsidian";
 // esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
 import waSqliteWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
+import tsdbWorkerSource from "tsdb-worker-source";
 import { installMetricsGlobal } from "./api/debug-global";
 import { ApiHealthStatus, ApiServer } from "./api/server";
 import {
@@ -27,25 +28,21 @@ import { IObsidianMetricsRootAPI } from "./types";
 import type { ErrnoError } from "./types/runtime";
 import { PromQLPanel } from "./panels/panel";
 import {
-	migrateLegacySnapshot,
-	readChunkedDatabaseImage,
-} from "./storage/chunk-vfs";
-import {
-	DEFAULT_CHUNK_DB_NAME,
-	DEFAULT_NODE_DB_NAME,
 	MetricsStore,
+	MetricsStoreLike,
 	QuickStoreStats,
-	StoreLocation,
 	StoredSample,
 } from "./storage/store";
 import {
-	migrateLegacySnapshotToNodeFile,
-	nodeFileExists,
-	nodeStorageDirectoryForAdapter,
-	writeNodeFileDatabase,
-} from "./storage/node-file-vfs";
+	LegacyStorageMigrationSource,
+	findLegacyStorageMigrationSource,
+	prepareStoreOpenPlan,
+	prepareWorkerOpfsOpenPlan,
+} from "./storage/backend";
 import { SampleWal } from "./storage/wal";
 import { maintainStartupWal } from "./storage/wal-maintenance";
+import { WorkerMetricsStore } from "./storage/worker-store";
+import { createInlineWorkerStoreTransport } from "./storage/worker-transport";
 import { TimeContext } from "./time/context";
 import { TimeSelectorController } from "./time/selector";
 import {
@@ -69,12 +66,12 @@ declare global {
 	}
 }
 
-const LEGACY_DB_FILENAME = "metrics.db";
-const TSDB_DIRNAME = "metrics-tsdb";
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
 const PROMQL_BLOCK_RE = /```[ \t]*promql[^\r\n]*(?:\r?\n)([\s\S]*?)(?:\r?\n)```/gi;
 const STALE_PROMQL_PANEL_TEXT = "promql panel: metrics store is not running";
+const STORAGE_MIGRATION_INITIAL_BATCH_SIZE = 20_000;
+const STORAGE_MIGRATION_MAX_BATCH_SIZE = 100_000;
 
 interface IngestHealth {
 	lastIngestMs: number | null;
@@ -83,11 +80,28 @@ interface IngestHealth {
 	lastIngestErrorMs: number | null;
 }
 
+export interface StorageMigrationCandidate {
+	backend: LegacyStorageMigrationSource["backend"];
+	label: string;
+	sizeBytes: number;
+}
+
+export interface StorageMigrationStatus {
+	state: "idle" | "running" | "done" | "error";
+	sourceLabel: string | null;
+	startedMs: number | null;
+	finishedMs: number | null;
+	importedSamples: number;
+	totalSamples: number | null;
+	error: string | null;
+}
+
 export default class ObsidianMetricsPlugin extends Plugin {
 	settings: ObsidianMetricsSettings = DEFAULT_SETTINGS;
 
 	private sources: MetricSourceRegistry | null = null;
-	private store: MetricsStore | null = null;
+	private store: MetricsStoreLike | null = null;
+	private storageBackend: ApiHealthStatus["store"]["backend"] = "unknown";
 	private wal: SampleWal | null = null;
 	private walStartupPromise: Promise<void> | null = null;
 	private walReplayCancelled = false;
@@ -107,6 +121,15 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		lastIngestSampleCount: 0,
 		lastIngestError: null,
 		lastIngestErrorMs: null,
+	};
+	private storageMigration: StorageMigrationStatus = {
+		state: "idle",
+		sourceLabel: null,
+		startedMs: null,
+		finishedMs: null,
+		importedSamples: 0,
+		totalSamples: null,
+		error: null,
 	};
 	private walHealth: WalHealthStatus = {
 		startup: "idle",
@@ -183,52 +206,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		// TSDB side: SQLite (wa-sqlite over a desktop .sqlite file when
 		// available, else the vault-adapter chunk VFS), WAL, scraper and query
 		// API. Every committed ingest is durable.
-		const adapter = this.app.vault.adapter;
 		const pluginDir = this.pluginDirectory();
-		const tsdbDir = `${pluginDir}/${TSDB_DIRNAME}`;
-		let storeLocation: StoreLocation = {
-			kind: "chunks",
-			adapter,
-			directory: tsdbDir,
-		};
-		let storeDbName = DEFAULT_CHUNK_DB_NAME;
-		const nodeDirectory = this.getNodeStorageDirectory();
-		if (nodeDirectory) {
-			try {
-				await this.prepareNodeFileDatabase(nodeDirectory, tsdbDir);
-				storeLocation = {
-					kind: "node-file",
-					directory: nodeDirectory,
-				};
-				storeDbName = DEFAULT_NODE_DB_NAME;
-			} catch (error) {
-				console.warn(
-					"tsdb: desktop sqlite backend unavailable, falling back to chunks",
-					error
-				);
-			}
-		}
-		if (storeLocation.kind === "chunks") {
-			try {
-				// One-time migration from the old sql.js whole-file snapshot.
-				const migrated = await migrateLegacySnapshot(
-					adapter,
-					`${pluginDir}/${LEGACY_DB_FILENAME}`,
-					tsdbDir,
-					DEFAULT_CHUNK_DB_NAME
-				);
-				if (migrated) {
-					console.log("tsdb: migrated legacy metrics.db snapshot");
-				}
-			} catch (error) {
-				console.warn("tsdb: legacy snapshot migration failed", error);
-			}
-		}
-		this.store = await MetricsStore.open({
-			location: storeLocation,
-			dbName: storeDbName,
-			wasmBinary: waSqliteWasm,
-		});
+		this.store = await this.openMetricsStore(pluginDir);
 
 		// The WAL remains as a recovery net. Entries are written only after
 		// their SQLite transaction commits, so a healthy database can checkpoint
@@ -496,6 +475,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.walStartupPromise = null;
 		this.walReplayCancelled = false;
 		this.store = null;
+		this.storageBackend = "unknown";
 		this.engine = null;
 		this.api = {
 			getStore: () => {
@@ -621,68 +601,227 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		return this.scraper?.getStatuses() ?? [];
 	}
 
-	// -- storage backend -----------------------------------------------------
-
-	private getNodeStorageDirectory(): string | null {
-		return nodeStorageDirectoryForAdapter(
-			this.app.vault.adapter as { getBasePath?: () => string },
-			this.pluginDirectory()
-		);
+	getStorageMigrationStatus(): StorageMigrationStatus {
+		return { ...this.storageMigration };
 	}
+
+	async getStorageMigrationCandidate(): Promise<StorageMigrationCandidate | null> {
+		if (this.storageBackend !== "worker-opfs") return null;
+		const source = await this.findLegacyMigrationSource();
+		if (!source) return null;
+		return {
+			backend: source.backend,
+			label: source.label,
+			sizeBytes: source.sizeBytes,
+		};
+	}
+
+	async migrateLegacyStorageToOpfs(): Promise<StorageMigrationStatus> {
+		if (this.storageMigration.state === "running") {
+			return this.getStorageMigrationStatus();
+		}
+		if (this.storageBackend !== "worker-opfs" || !this.store) {
+			throw new Error("Worker OPFS storage is not active.");
+		}
+		const source = await this.findLegacyMigrationSource();
+		if (!source) {
+			throw new Error(
+				"No importable desktop SQLite or chunked database was found."
+			);
+		}
+
+		const target = this.store;
+		let sourceStore: MetricsStore | null = null;
+		const startedMs = Date.now();
+		this.storageMigration = {
+			state: "running",
+			sourceLabel: source.label,
+			startedMs,
+			finishedMs: null,
+			importedSamples: 0,
+			totalSamples: null,
+			error: null,
+		};
+		this.settingsTab?.onStorageMigrationChanged();
+
+		try {
+			sourceStore = await MetricsStore.open({
+				location: source.location,
+				dbName: source.dbName,
+				wasmBinary: waSqliteWasm,
+				recoverCorruption: false,
+			});
+			const stats = await sourceStore.quickStats();
+			this.storageMigration.totalSamples = stats.sampleCount;
+			this.settingsTab?.onStorageMigrationChanged();
+			if (stats.sampleCount === null) {
+				this.startStorageMigrationTotalCount(source, startedMs);
+			}
+
+			await sourceStore.exportSamples({
+				batchSize: STORAGE_MIGRATION_INITIAL_BATCH_SIZE,
+				adaptiveBatching: {
+					minBatchSize: STORAGE_MIGRATION_INITIAL_BATCH_SIZE,
+					maxBatchSize: STORAGE_MIGRATION_MAX_BATCH_SIZE,
+					growBelowMs: 1500,
+					shrinkAboveMs: 8000,
+				},
+				onBatch: async (samples) => {
+					await target.importSamples(samples);
+				},
+				onProgress: ({ samples }) => {
+					this.storageMigration.importedSamples = samples;
+					this.settingsTab?.onStorageMigrationChanged();
+				},
+			});
+
+			this.storageMigration = {
+				...this.storageMigration,
+				state: "done",
+				finishedMs: Date.now(),
+				totalSamples:
+					this.storageMigration.totalSamples ??
+					this.storageMigration.importedSamples,
+				error: null,
+			};
+			new Notice("TSDB history migrated into OPFS.");
+			return this.getStorageMigrationStatus();
+		} catch (error) {
+			this.storageMigration = {
+				...this.storageMigration,
+				state: "error",
+				finishedMs: Date.now(),
+				error: error instanceof Error ? error.message : String(error),
+			};
+			throw error;
+		} finally {
+			await sourceStore?.close().catch((error) => {
+				console.warn("tsdb: migration source close failed", error);
+			});
+			this.settingsTab?.onStorageMigrationChanged();
+		}
+	}
+
+	// -- storage backend -----------------------------------------------------
 
 	private pluginDirectory(): string {
 		return this.manifest.dir ?? this.manifest.id;
 	}
 
-	private async prepareNodeFileDatabase(
-		nodeDirectory: string,
-		chunkDirectory: string
-	): Promise<void> {
-		if (await nodeFileExists(nodeDirectory, DEFAULT_NODE_DB_NAME)) return;
+	private findLegacyMigrationSource(): Promise<LegacyStorageMigrationSource | null> {
+		return findLegacyStorageMigrationSource({
+			adapter: this.app.vault.adapter,
+			pluginDir: this.pluginDirectory(),
+		});
+	}
 
-		const legacyPath = `${this.pluginDirectory()}/${LEGACY_DB_FILENAME}`;
-		const migratedLegacy = await migrateLegacySnapshotToNodeFile(
-			this.app.vault.adapter,
-			legacyPath,
-			nodeDirectory,
-			DEFAULT_NODE_DB_NAME
+	private storageNamespace(): string {
+		const adapter = this.app.vault.adapter as typeof this.app.vault.adapter & {
+			basePath?: string;
+			getBasePath?: () => string;
+		};
+		return (
+			adapter.getBasePath?.() ??
+			adapter.basePath ??
+			this.app.vault.getName() ??
+			this.app.appId ??
+			this.pluginDirectory()
 		);
-		if (migratedLegacy) {
-			console.log("tsdb: migrated legacy metrics.db snapshot to metrics.sqlite");
-			return;
+	}
+
+	private startStorageMigrationTotalCount(
+		source: LegacyStorageMigrationSource,
+		startedMs: number
+	): void {
+		void (async () => {
+			let countStore: MetricsStore | null = null;
+			try {
+				countStore = await MetricsStore.open({
+					location: source.location,
+					dbName: source.dbName,
+					wasmBinary: waSqliteWasm,
+					recoverCorruption: false,
+				});
+				const totalSamples = await countStore.countSamples();
+				if (
+					this.storageMigration.state === "running" &&
+					this.storageMigration.startedMs === startedMs &&
+					this.storageMigration.totalSamples === null
+				) {
+					this.storageMigration.totalSamples = totalSamples;
+					this.settingsTab?.onStorageMigrationChanged();
+				}
+			} catch (error) {
+				console.warn("tsdb: could not count migration source samples", error);
+			} finally {
+				await countStore?.close().catch((error) => {
+					console.warn("tsdb: migration count source close failed", error);
+				});
+			}
+		})();
+	}
+
+	private async openMetricsStore(pluginDir: string): Promise<MetricsStoreLike> {
+		let opfsFailure: unknown = null;
+		if (this.settings.storage.workerBackend) {
+			const workerPlan = await prepareWorkerOpfsOpenPlan({
+				adapter: this.app.vault.adapter,
+				pluginDir,
+				namespace: this.storageNamespace(),
+			});
+			if (workerPlan) {
+				try {
+					const store = await WorkerMetricsStore.open(
+						createInlineWorkerStoreTransport(tsdbWorkerSource),
+						{
+							dbName: workerPlan.dbName,
+							wasmBinary: waSqliteWasm,
+						}
+					);
+					console.log("tsdb: using worker OPFS backend");
+					this.storageBackend = "worker-opfs";
+					return store;
+				} catch (error) {
+					opfsFailure = error;
+					console.warn("tsdb: worker OPFS backend failed", error);
+				}
+			} else {
+				opfsFailure = new Error(
+					"Worker OPFS storage is unavailable in this runtime."
+				);
+			}
+		} else {
+			opfsFailure = new Error("Worker OPFS storage is disabled in settings.");
 		}
 
-		const existingChunkImage = await readChunkedDatabaseImage(
-			this.app.vault.adapter,
-			chunkDirectory,
-			DEFAULT_CHUNK_DB_NAME
-		);
-		if (!existingChunkImage || existingChunkImage.byteLength === 0) return;
+		if (!this.settings.storage.allowLegacyBackends) {
+			const message = this.errorMessage(opfsFailure);
+			new Notice(`TSDB OPFS storage could not start. ${message}`, 10000);
+			throw opfsFailure instanceof Error ? opfsFailure : new Error(message);
+		}
 
-		const chunkStore = await MetricsStore.open({
-			location: {
-				kind: "chunks",
-				adapter: this.app.vault.adapter,
-				directory: chunkDirectory,
-			},
-			dbName: DEFAULT_CHUNK_DB_NAME,
+		console.warn(
+			"tsdb: using explicitly enabled non-OPFS storage backend",
+			opfsFailure
+		);
+		const storePlan = await prepareStoreOpenPlan({
+			adapter: this.app.vault.adapter,
+			pluginDir,
 			wasmBinary: waSqliteWasm,
 		});
-		await chunkStore.close();
+		const store = await MetricsStore.open({
+			location: storePlan.location,
+			dbName: storePlan.dbName,
+			wasmBinary: waSqliteWasm,
+		});
+		this.storageBackend = storePlan.backend;
+		return store;
+	}
 
-		const chunkImage = await readChunkedDatabaseImage(
-			this.app.vault.adapter,
-			chunkDirectory,
-			DEFAULT_CHUNK_DB_NAME
-		);
-		if (chunkImage && chunkImage.byteLength > 0) {
-			await writeNodeFileDatabase(
-				nodeDirectory,
-				DEFAULT_NODE_DB_NAME,
-				chunkImage
-			);
-			console.log("tsdb: seeded metrics.sqlite from chunked database");
-		}
+	private errorMessage(error: unknown): string {
+		if (error instanceof Error) return error.message;
+		if (error === null || error === undefined) return "Unknown OPFS error.";
+		return String(error);
 	}
 
 	restartMaintenanceTimers(): void {
@@ -765,8 +904,22 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	}
 
 	private async waitForInFlightIngests(): Promise<void> {
-		while (this.inFlightIngests.size > 0) {
-			await Promise.allSettled(Array.from(this.inFlightIngests));
+		const deadline = Date.now() + 2000;
+		while (this.inFlightIngests.size > 0 && Date.now() < deadline) {
+			const remaining = Math.max(0, deadline - Date.now());
+			await Promise.race([
+				Promise.allSettled(Array.from(this.inFlightIngests)),
+				new Promise<void>((resolve) =>
+					window.setTimeout(resolve, Math.min(250, remaining))
+				),
+			]);
+		}
+		if (this.inFlightIngests.size > 0) {
+			console.warn(
+				"tsdb: abandoning in-flight ingests during teardown",
+				this.inFlightIngests.size
+			);
+			this.inFlightIngests.clear();
 		}
 	}
 
@@ -930,6 +1083,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			ok,
 			store: {
 				open: storeOpen,
+				backend: this.storageBackend,
 			},
 			queryEngine: {
 				ready: queryEngineReady,

@@ -9,6 +9,11 @@ import {
 } from "../labels";
 import { AdapterChunkVFS, ChunkAdapter } from "./chunk-vfs";
 import { NodeFileVFS, deleteNodeDatabaseFiles } from "./node-file-vfs";
+import {
+	OPFS_VFS_NAME,
+	createOpfsVfs,
+	deleteOpfsDatabaseFiles,
+} from "./opfs-vfs";
 
 export interface Point {
 	/** Unix milliseconds. */
@@ -57,6 +62,48 @@ export interface OpenOptions {
 	wasmBinary?: ArrayBuffer | Uint8Array;
 	dbName?: string;
 	location: StoreLocation;
+	/** Disable destructive recovery when opening a database as a migration source. */
+	recoverCorruption?: boolean;
+}
+
+export interface MetricsStoreLike {
+	readonly isOpen: boolean;
+	readonly recoveredFromCorruption: boolean;
+	ingest(samples: StoredSample[]): Promise<void>;
+	importSamples(samples: StoredSample[]): Promise<void>;
+	select(
+		matchers: Matcher[],
+		startMs: number,
+		endMs: number
+	): Promise<SeriesData[]>;
+	seriesMatching(
+		matchers: Matcher[],
+		startMs?: number,
+		endMs?: number
+	): Promise<Labels[]>;
+	labelNames(matchers?: Matcher[]): Promise<string[]>;
+	labelValues(labelName: string, matchers?: Matcher[]): Promise<string[]>;
+	deleteBefore(cutoffMs: number): Promise<void>;
+	quickStats(): Promise<QuickStoreStats>;
+	stats(): Promise<StoreStats>;
+	close(): Promise<void>;
+}
+
+export interface ExportSamplesOptions {
+	batchSize?: number;
+	adaptiveBatching?: {
+		minBatchSize?: number;
+		maxBatchSize?: number;
+		growBelowMs?: number;
+		shrinkAboveMs?: number;
+	};
+	onBatch(samples: StoredSample[]): Promise<void>;
+	onProgress?(progress: { samples: number; batches: number }): void;
+}
+
+export interface ExportSamplesResult {
+	samples: number;
+	batches: number;
 }
 
 export type StoreLocation =
@@ -70,6 +117,9 @@ export type StoreLocation =
 			kind: "node-file";
 			/** Folder holding the desktop metrics.sqlite file. */
 			directory: string;
+	  }
+	| {
+			kind: "opfs";
 	  };
 
 interface CachedSeries {
@@ -82,6 +132,10 @@ interface IngestRow {
 	seriesKey: string;
 	ts: number;
 	value: number;
+}
+
+interface IngestOptions {
+	updateExisting: boolean;
 }
 
 const CHUNK_VFS_NAME = "tsdb-chunks";
@@ -119,10 +173,10 @@ CREATE TABLE IF NOT EXISTS sample_rollup_1m (
 `;
 
 /**
- * Time-series store on wa-sqlite (Asyncify build) over either a desktop
- * Node-backed SQLite file or the vault-adapter chunk VFS fallback.
+ * Time-series store on wa-sqlite (Asyncify build) over a desktop SQLite file,
+ * worker OPFS, or the vault-adapter chunk VFS fallback.
  */
-export class MetricsStore {
+export class MetricsStore implements MetricsStoreLike {
 	private sqlite3: SQLiteAPI;
 	private db: number;
 	readonly recoveredFromCorruption: boolean;
@@ -159,7 +213,8 @@ export class MetricsStore {
 	private constructor(
 		sqlite3: SQLiteAPI,
 		db: number,
-		recoveredFromCorruption: boolean
+		recoveredFromCorruption: boolean,
+		private vfs: CloseableVfs | null
 	) {
 		this.sqlite3 = sqlite3;
 		this.db = db;
@@ -171,11 +226,7 @@ export class MetricsStore {
 	}
 
 	static async open(options: OpenOptions): Promise<MetricsStore> {
-		const dbName =
-			options.dbName ??
-			(options.location.kind === "node-file"
-				? DEFAULT_NODE_DB_NAME
-				: DEFAULT_CHUNK_DB_NAME);
+		const dbName = options.dbName ?? defaultDbNameForLocation(options.location);
 		const openOnce = async (
 			recoveredFromCorruption: boolean
 		): Promise<MetricsStore> => {
@@ -183,24 +234,35 @@ export class MetricsStore {
 				options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}
 			);
 			const sqlite3 = SQLite.Factory(module);
-			const vfsName =
-				options.location.kind === "node-file"
-					? NODE_FILE_VFS_NAME
-					: CHUNK_VFS_NAME;
-			sqlite3.vfs_register(createVfs(vfsName, options.location), false);
-			const db = await sqlite3.open_v2(
-				dbName,
-				SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
-				vfsName
-			);
-			const store = new MetricsStore(sqlite3, db, recoveredFromCorruption);
-			await store.init();
-			return store;
+			const vfsName = vfsNameForLocation(options.location);
+			const vfs = createVfs(vfsName, options.location, dbName) as SQLiteVFS &
+				CloseableVfs;
+			try {
+				await vfs.isReady;
+				sqlite3.vfs_register(vfs, false);
+				const db = await sqlite3.open_v2(
+					dbName,
+					SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
+					vfsName
+				);
+				const store = new MetricsStore(
+					sqlite3,
+					db,
+					recoveredFromCorruption,
+					vfs
+				);
+				await store.init();
+				return store;
+			} catch (error) {
+				await Promise.resolve(vfs.close?.()).catch(() => undefined);
+				throw error;
+			}
 		};
 
 		try {
 			return await openOnce(false);
 		} catch (error) {
+			if (options.recoverCorruption === false) throw error;
 			// Unreadable/corrupt database: wipe the active backend and start fresh.
 			console.error(
 				"tsdb: stored database unreadable, starting fresh",
@@ -512,10 +574,23 @@ export class MetricsStore {
 	/** Append a batch of samples in one transaction (durable on commit). */
 	ingest(samples: StoredSample[]): Promise<void> {
 		if (samples.length === 0) return Promise.resolve();
-		return this.enqueue(() => this.ingestLocked(samples));
+		return this.enqueue(() =>
+			this.ingestLocked(samples, { updateExisting: true })
+		);
 	}
 
-	private async ingestLocked(samples: StoredSample[]): Promise<void> {
+	/** Copy historical samples without rewriting rows that are already present. */
+	importSamples(samples: StoredSample[]): Promise<void> {
+		if (samples.length === 0) return Promise.resolve();
+		return this.enqueue(() =>
+			this.ingestLocked(samples, { updateExisting: false })
+		);
+	}
+
+	private async ingestLocked(
+		samples: StoredSample[],
+		options: IngestOptions
+	): Promise<void> {
 		const rows: IngestRow[] = [];
 		for (const sample of samples) {
 			if (!Number.isFinite(sample.ts)) continue;
@@ -534,7 +609,9 @@ export class MetricsStore {
 		try {
 			await this.createMissingSeries(rows);
 			const insertStmt = await this.getInsertSampleStmt();
-			const updateStmt = await this.getUpdateSampleStmt();
+			const updateStmt = options.updateExisting
+				? await this.getUpdateSampleStmt()
+				: null;
 			let insertedRows = 0;
 			let oldestInserted: number | null = null;
 			let newestInserted: number | null = null;
@@ -563,11 +640,17 @@ export class MetricsStore {
 					continue;
 				}
 
-				this.sqlite3.bind_collection(updateStmt, [row.value, seriesId, row.ts]);
-				try {
-					await this.sqlite3.step(updateStmt);
-				} finally {
-					await this.resetPreparedStatement(updateStmt);
+				if (updateStmt !== null) {
+					this.sqlite3.bind_collection(updateStmt, [
+						row.value,
+						seriesId,
+						row.ts,
+					]);
+					try {
+						await this.sqlite3.step(updateStmt);
+					} finally {
+						await this.resetPreparedStatement(updateStmt);
+					}
 				}
 			}
 			if (insertedRows > 0) {
@@ -765,6 +848,72 @@ export class MetricsStore {
 		return this.enqueue(() => this.quickStatsLocked());
 	}
 
+	countSamples(): Promise<number> {
+		return this.enqueue(() => this.countSamplesLocked());
+	}
+
+	exportSamples(options: ExportSamplesOptions): Promise<ExportSamplesResult> {
+		return this.enqueue(() => this.exportSamplesLocked(options));
+	}
+
+	private async exportSamplesLocked(
+		options: ExportSamplesOptions
+	): Promise<ExportSamplesResult> {
+		let batchSize = Math.max(1, Math.floor(options.batchSize ?? 1000));
+		const adaptive = options.adaptiveBatching;
+		const minBatchSize = Math.max(
+			1,
+			Math.floor(adaptive?.minBatchSize ?? batchSize)
+		);
+		const maxBatchSize = Math.max(
+			minBatchSize,
+			Math.floor(adaptive?.maxBatchSize ?? batchSize)
+		);
+		const growBelowMs = adaptive?.growBelowMs ?? 1200;
+		const shrinkAboveMs = adaptive?.shrinkAboveMs ?? 8000;
+		const batch: StoredSample[] = [];
+		let samples = 0;
+		let batches = 0;
+
+		const flush = async () => {
+			if (batch.length === 0) return;
+			const pending = batch.splice(0);
+			const started = Date.now();
+			await options.onBatch(pending);
+			const elapsedMs = Date.now() - started;
+			if (adaptive) {
+				if (elapsedMs < growBelowMs && batchSize < maxBatchSize) {
+					batchSize = Math.min(maxBatchSize, batchSize * 2);
+				} else if (elapsedMs > shrinkAboveMs && batchSize > minBatchSize) {
+					batchSize = Math.max(minBatchSize, Math.floor(batchSize / 2));
+				}
+			}
+			samples += pending.length;
+			batches++;
+			options.onProgress?.({ samples, batches });
+		};
+
+		await this.withStatement(
+			`SELECT series.labels_json, samples.ts, samples.value
+			 FROM samples
+			 JOIN series ON series.id = samples.series_id
+			 ORDER BY samples.series_id, samples.ts`,
+			async (stmt) => {
+				while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+					const row = this.sqlite3.row(stmt);
+					batch.push({
+						labels: JSON.parse(row[0] as string) as Labels,
+						ts: row[1] as number,
+						value: row[2] as number,
+					});
+					if (batch.length >= batchSize) await flush();
+				}
+			}
+		);
+		await flush();
+		return { samples, batches };
+	}
+
 	private async quickStatsLocked(): Promise<QuickStoreStats> {
 		const stats: QuickStoreStats = {
 			seriesCount: this.allSeries.length,
@@ -798,6 +947,14 @@ export class MetricsStore {
 			);
 		}
 		return stats;
+	}
+
+	private async countSamplesLocked(): Promise<number> {
+		let count = 0;
+		await this.sqlite3.exec(this.db, "SELECT count(*) FROM samples", (row) => {
+			count = (row[0] as number) ?? 0;
+		});
+		return count;
 	}
 
 	private async statsLocked(): Promise<StoreStats> {
@@ -846,6 +1003,8 @@ export class MetricsStore {
 			.then(async () => {
 				await this.finalizePreparedStatements();
 				await this.sqlite3.close(this.db);
+				await this.vfs?.close?.();
+				this.vfs = null;
 			})
 			.then(
 				() => {
@@ -878,9 +1037,29 @@ function bucketStart(ts: number): number {
 	return Math.floor(ts / ROLLUP_BUCKET_MS) * ROLLUP_BUCKET_MS;
 }
 
-function createVfs(vfsName: string, location: StoreLocation) {
+function defaultDbNameForLocation(location: StoreLocation): string {
+	return location.kind === "chunks"
+		? DEFAULT_CHUNK_DB_NAME
+		: DEFAULT_NODE_DB_NAME;
+}
+
+function vfsNameForLocation(location: StoreLocation): string {
+	if (location.kind === "node-file") return NODE_FILE_VFS_NAME;
+	if (location.kind === "opfs") return OPFS_VFS_NAME;
+	return CHUNK_VFS_NAME;
+}
+
+interface CloseableVfs {
+	isReady?: Promise<unknown>;
+	close?: () => Promise<void> | void;
+}
+
+function createVfs(vfsName: string, location: StoreLocation, dbName: string) {
 	if (location.kind === "node-file") {
 		return new NodeFileVFS(vfsName, location.directory);
+	}
+	if (location.kind === "opfs") {
+		return createOpfsVfs(dbName);
 	}
 	return new AdapterChunkVFS(vfsName, location.adapter, location.directory);
 }
@@ -892,6 +1071,10 @@ export async function wipeDatabaseFiles(
 ): Promise<void> {
 	if (location.kind === "node-file") {
 		await deleteNodeDatabaseFiles(location.directory, dbName);
+		return;
+	}
+	if (location.kind === "opfs") {
+		await deleteOpfsDatabaseFiles(dbName);
 		return;
 	}
 	const vfs = new AdapterChunkVFS(

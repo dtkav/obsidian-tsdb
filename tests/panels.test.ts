@@ -37,7 +37,7 @@ const fakeYaml = (text: string): unknown => {
 
 const HEALTHY: ApiHealthStatus = {
 	ok: true,
-	store: { open: true },
+	store: { open: true, backend: "node-file" },
 	queryEngine: { ready: true },
 	api: { running: false, port: null },
 	ingest: {

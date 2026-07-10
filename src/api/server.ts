@@ -1,7 +1,7 @@
 import { PromQLError, parseDuration } from "../promql/ast";
 import { PromQLEngine } from "../promql/engine";
 import { parseSeriesSelector } from "../promql/parser";
-import { MetricsStore } from "../storage/store";
+import type { MetricsStoreLike } from "../storage/store";
 import { Matcher } from "../labels";
 import type { ApiHealthStatus } from "../health";
 import type {
@@ -24,7 +24,7 @@ export interface ApiServerDeps {
 	/** Text exposition of the live prom-client registry (the /metrics page). */
 	getExposition: () => Promise<string>;
 	engine: PromQLEngine;
-	store: MetricsStore;
+	store: MetricsStoreLike;
 	getHealth: () => ApiHealthStatus;
 	getMetricsPath: () => string;
 	pluginVersion: string;
