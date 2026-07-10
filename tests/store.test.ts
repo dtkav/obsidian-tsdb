@@ -2,6 +2,8 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
+import * as SQLite from "wa-sqlite";
+import SQLiteAsyncESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
 import {
 	LEGACY_DB_FILENAME,
 	TSDB_DIRNAME,
@@ -16,6 +18,7 @@ import {
 	readChunkedDatabaseImage,
 } from "../src/storage/chunk-vfs";
 import {
+	NodeFileVFS,
 	nodeStorageDirectoryForAdapter,
 	readNodeFileDatabase,
 	writeNodeFileDatabase,
@@ -284,34 +287,38 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		await closing;
 	});
 
-	it("handles a multi-chunk database (spans chunk boundaries)", async () => {
-		const { store } = await openStore();
-		// ~200 series × 50 samples ≈ enough pages to cross 64 KiB chunks.
-		const batch = [];
-		for (let s = 0; s < 200; s++) {
-			for (let i = 0; i < 50; i++) {
-				batch.push({
-					labels: { [NAME]: "bulk", idx: String(s) },
-					ts: i * 1000,
-					value: s + i,
-				});
+	it(
+		"handles a multi-chunk database (spans chunk boundaries)",
+		async () => {
+			const { store } = await openStore();
+			// ~200 series x 50 samples is enough to cross 64 KiB chunks.
+			const batch = [];
+			for (let s = 0; s < 200; s++) {
+				for (let i = 0; i < 50; i++) {
+					batch.push({
+						labels: { [NAME]: "bulk", idx: String(s) },
+						ts: i * 1000,
+						value: s + i,
+					});
+				}
 			}
-		}
-		await store.ingest(batch);
-		const stats = await store.stats();
-		expect(stats.sampleCount).toBe(10_000);
-		expect(stats.seriesCount).toBe(200);
-		const one = await store.select(
-			[
-				{ name: NAME, op: "=", value: "bulk" },
-				{ name: "idx", op: "=", value: "137" },
-			],
-			0,
-			60_000
-		);
-		expect(one[0].points).toHaveLength(50);
-		await store.close();
-	});
+			await store.ingest(batch);
+			const stats = await store.stats();
+			expect(stats.sampleCount).toBe(10_000);
+			expect(stats.seriesCount).toBe(200);
+			const one = await store.select(
+				[
+					{ name: NAME, op: "=", value: "bulk" },
+					{ name: "idx", op: "=", value: "137" },
+				],
+				0,
+				60_000
+			);
+			expect(one[0].points).toHaveLength(50);
+			await store.close();
+		},
+		10_000
+	);
 
 	it("batches wide selects across many matching series", async () => {
 		const { store } = await openStore();
@@ -371,6 +378,33 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 });
 
 describe("MetricsStore (wa-sqlite over Node file VFS)", () => {
+	it("replaces an incompatible row-format database", async () => {
+		await withTempDir(async (dir) => {
+			const module = await SQLiteAsyncESMFactory({ wasmBinary: WASM });
+			const sqlite3 = SQLite.Factory(module);
+			const vfs = new NodeFileVFS("legacy-row-format", dir);
+			sqlite3.vfs_register(vfs, false);
+			const db = await sqlite3.open_v2(
+				DEFAULT_NODE_DB_NAME,
+				SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
+				vfs.name
+			);
+			await sqlite3.exec(
+				db,
+				"CREATE TABLE samples(series_id INTEGER, ts INTEGER, value REAL)"
+			);
+			await sqlite3.close(db);
+
+			const store = await MetricsStore.open({
+				location: { kind: "node-file", directory: dir },
+				wasmBinary: WASM,
+			});
+			expect(store.recoveredFromCorruption).toBe(true);
+			expect((await store.stats()).sampleCount).toBe(0);
+			await store.close();
+		});
+	});
+
 	it("persists samples in a normal metrics.sqlite file", async () => {
 		await withTempDir(async (dir) => {
 			const first = await MetricsStore.open({

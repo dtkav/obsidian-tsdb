@@ -14,6 +14,7 @@ import {
 	createOpfsVfs,
 	deleteOpfsDatabaseFiles,
 } from "./opfs-vfs";
+import { TsdbBatchRow, encodeTsdbBatch } from "./tsdb-batch";
 
 export interface Point {
 	/** Unix milliseconds. */
@@ -134,10 +135,6 @@ interface IngestRow {
 	value: number;
 }
 
-interface IngestOptions {
-	updateExisting: boolean;
-}
-
 const CHUNK_VFS_NAME = "tsdb-chunks";
 const NODE_FILE_VFS_NAME = "tsdb-node-file";
 export const DEFAULT_CHUNK_DB_NAME = "metrics";
@@ -148,6 +145,8 @@ const META_NEWEST_SAMPLE_MS = "newest_sample_ms";
 const META_ROLLUP_1M_STARTED_MS = "rollup_1m_started_ms";
 const ROLLUP_BUCKET_MS = 60_000;
 const SELECT_SERIES_BATCH_SIZE = 250;
+const TSDB_BLOCK_SPAN_MS = 21_600_000;
+const TSDB_COMPACTION_LIMIT = 16;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
@@ -155,13 +154,10 @@ CREATE TABLE IF NOT EXISTS series (
 	labels_key TEXT NOT NULL UNIQUE,
 	labels_json TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS samples (
-	series_id INTEGER NOT NULL,
-	ts INTEGER NOT NULL,
-	value REAL NOT NULL,
-	PRIMARY KEY (series_id, ts)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);
+CREATE VIRTUAL TABLE IF NOT EXISTS samples USING tsdb(
+	block_span_ms=${TSDB_BLOCK_SPAN_MS},
+	max_block_points=2048
+);
 CREATE TABLE IF NOT EXISTS store_meta (
 	key TEXT PRIMARY KEY,
 	value INTEGER NOT NULL
@@ -187,8 +183,6 @@ export class MetricsStore implements MetricsStoreLike {
 	private seriesByKey = new Map<string, CachedSeries>();
 	private allSeries: CachedSeries[] = [];
 	private insertSeriesStmt: number | null = null;
-	private insertSampleStmt: number | null = null;
-	private updateSampleStmt: number | null = null;
 
 	/**
 	 * wa-sqlite's Asyncify build forbids reentrant calls: while one
@@ -233,14 +227,21 @@ export class MetricsStore implements MetricsStoreLike {
 			const module: unknown = await SQLiteAsyncESMFactory(
 				options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}
 			);
+			const registerResult = registerTsdbExtension(module);
+			if (registerResult !== SQLite.SQLITE_OK) {
+				throw new Error(
+					`tsdb: extension registration failed (${registerResult})`
+				);
+			}
 			const sqlite3 = SQLite.Factory(module);
 			const vfsName = vfsNameForLocation(options.location);
 			const vfs = createVfs(vfsName, options.location, dbName) as SQLiteVFS &
 				CloseableVfs;
+			let db: number | null = null;
 			try {
 				await vfs.isReady;
 				sqlite3.vfs_register(vfs, false);
-				const db = await sqlite3.open_v2(
+				db = await sqlite3.open_v2(
 					dbName,
 					SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
 					vfsName
@@ -254,6 +255,9 @@ export class MetricsStore implements MetricsStoreLike {
 				await store.init();
 				return store;
 			} catch (error) {
+				if (db !== null) {
+					await sqlite3.close(db).catch(() => undefined);
+				}
 				await Promise.resolve(vfs.close?.()).catch(() => undefined);
 				throw error;
 			}
@@ -277,9 +281,24 @@ export class MetricsStore implements MetricsStoreLike {
 		await this.sqlite3.exec(this.db, "PRAGMA journal_mode=PERSIST");
 		await this.sqlite3.exec(this.db, "PRAGMA synchronous=NORMAL");
 		await this.sqlite3.exec(this.db, "PRAGMA cache_size=-4096"); // 4 MiB
+		await this.requireCompatibleSampleSchema();
 		await this.sqlite3.exec(this.db, SCHEMA);
 		await this.loadSeriesCache();
 		await this.initializeStatsMetadata();
+	}
+
+	private async requireCompatibleSampleSchema(): Promise<void> {
+		let existingSql: string | null = null;
+		await this.sqlite3.exec(
+			this.db,
+			"SELECT sql FROM sqlite_master WHERE name = 'samples'",
+			(row) => {
+				existingSql = row[0] as string | null;
+			}
+		);
+		if (existingSql !== null && !/\bUSING\s+tsdb\b/i.test(existingSql)) {
+			throw new Error("tsdb: incompatible sample storage format");
+		}
 	}
 
 	/** Run `fn` against the single prepared statement in `sql`. */
@@ -319,24 +338,6 @@ export class MetricsStore implements MetricsStoreLike {
 		return this.insertSeriesStmt;
 	}
 
-	private async getInsertSampleStmt(): Promise<number> {
-		if (this.insertSampleStmt === null) {
-			this.insertSampleStmt = await this.prepareStatement(
-				"INSERT OR IGNORE INTO samples (series_id, ts, value) VALUES (?, ?, ?)"
-			);
-		}
-		return this.insertSampleStmt;
-	}
-
-	private async getUpdateSampleStmt(): Promise<number> {
-		if (this.updateSampleStmt === null) {
-			this.updateSampleStmt = await this.prepareStatement(
-				"UPDATE samples SET value = ? WHERE series_id = ? AND ts = ?"
-			);
-		}
-		return this.updateSampleStmt;
-	}
-
 	private async resetPreparedStatement(stmt: number): Promise<void> {
 		try {
 			await this.sqlite3.reset(stmt);
@@ -348,8 +349,6 @@ export class MetricsStore implements MetricsStoreLike {
 
 	private async discardPreparedStatement(stmt: number): Promise<void> {
 		if (this.insertSeriesStmt === stmt) this.insertSeriesStmt = null;
-		if (this.insertSampleStmt === stmt) this.insertSampleStmt = null;
-		if (this.updateSampleStmt === stmt) this.updateSampleStmt = null;
 		await this.sqlite3.finalize(stmt).catch(() => undefined);
 	}
 
@@ -574,106 +573,113 @@ export class MetricsStore implements MetricsStoreLike {
 	/** Append a batch of samples in one transaction (durable on commit). */
 	ingest(samples: StoredSample[]): Promise<void> {
 		if (samples.length === 0) return Promise.resolve();
-		return this.enqueue(() =>
-			this.ingestLocked(samples, { updateExisting: true })
-		);
+		return this.enqueue(() => this.ingestLocked(samples, true));
 	}
 
 	/** Copy historical samples without rewriting rows that are already present. */
 	importSamples(samples: StoredSample[]): Promise<void> {
 		if (samples.length === 0) return Promise.resolve();
-		return this.enqueue(() =>
-			this.ingestLocked(samples, { updateExisting: false })
-		);
+		return this.enqueue(() => this.ingestLocked(samples, false));
 	}
 
 	private async ingestLocked(
 		samples: StoredSample[],
-		options: IngestOptions
+		overwriteExisting: boolean
 	): Promise<void> {
-		const rows: IngestRow[] = [];
+		const rowsByKey = new Map<string, IngestRow>();
 		for (const sample of samples) {
-			if (!Number.isFinite(sample.ts)) continue;
+			if (!Number.isFinite(sample.ts) || sample.ts < 0) continue;
 			// SQLite stores NaN as NULL; drop such samples instead.
 			if (Number.isNaN(sample.value)) continue;
-			rows.push({
+			const row = {
 				labels: sample.labels,
 				seriesKey: canonicalLabels(sample.labels),
 				ts: Math.round(sample.ts),
 				value: sample.value,
-			});
+			};
+			rowsByKey.set(`${row.seriesKey}\0${row.ts}`, row);
 		}
+		const rows = Array.from(rowsByKey.values());
 		if (rows.length === 0) return;
 
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
 			await this.createMissingSeries(rows);
-			const insertStmt = await this.getInsertSampleStmt();
-			const updateStmt = options.updateExisting
-				? await this.getUpdateSampleStmt()
-				: null;
-			let insertedRows = 0;
-			let oldestInserted: number | null = null;
-			let newestInserted: number | null = null;
-			const bucketCounts = new Map<number, number>();
-			for (const row of rows) {
+			const batchRows: TsdbBatchRow[] = rows.map((row) => {
 				const seriesId = this.seriesByKey.get(row.seriesKey)?.id;
 				if (seriesId === undefined) {
 					throw new Error("tsdb: series cache miss during ingest");
 				}
-				this.sqlite3.bind_collection(insertStmt, [seriesId, row.ts, row.value]);
-				let inserted = false;
-				try {
-					await this.sqlite3.step(insertStmt);
-					inserted = this.sqlite3.changes(this.db) > 0;
-				} finally {
-					await this.resetPreparedStatement(insertStmt);
-				}
-				if (inserted) {
-					insertedRows++;
-					oldestInserted =
-						oldestInserted === null ? row.ts : Math.min(oldestInserted, row.ts);
-					newestInserted =
-						newestInserted === null ? row.ts : Math.max(newestInserted, row.ts);
-					const bucketMs = bucketStart(row.ts);
-					bucketCounts.set(bucketMs, (bucketCounts.get(bucketMs) ?? 0) + 1);
-					continue;
-				}
-
-				if (updateStmt !== null) {
-					this.sqlite3.bind_collection(updateStmt, [
-						row.value,
-						seriesId,
-						row.ts,
-					]);
-					try {
-						await this.sqlite3.step(updateStmt);
-					} finally {
-						await this.resetPreparedStatement(updateStmt);
+				return { seriesId, ts: row.ts, value: row.value };
+			});
+			const batch = encodeTsdbBatch(batchRows);
+			let oldestBatchTs = batchRows[0].ts;
+			let newestBatchTs = batchRows[0].ts;
+			for (const row of batchRows.slice(1)) {
+				oldestBatchTs = Math.min(oldestBatchTs, row.ts);
+				newestBatchTs = Math.max(newestBatchTs, row.ts);
+			}
+			let insertedRows = 0;
+			const bucketCounts = new Map<number, number>();
+			await this.withStatement(
+				`SELECT incoming.ts - (incoming.ts % ?), count(*)
+				 FROM tsdb_batch(?) AS incoming
+				 WHERE NOT EXISTS (
+					 SELECT 1 FROM samples
+					 WHERE series_id = incoming.series_id AND ts = incoming.ts
+				 )
+				 GROUP BY 1`,
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [ROLLUP_BUCKET_MS, batch]);
+					while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+						const row = this.sqlite3.row(stmt);
+						const count = row[1] as number;
+						bucketCounts.set(row[0] as number, count);
+						insertedRows += count;
 					}
 				}
-			}
+			);
+			const insertSql = overwriteExisting
+				? `INSERT INTO samples(series_id,ts,value)
+				   SELECT series_id,ts,value FROM tsdb_batch(?)`
+				: `INSERT INTO samples(series_id,ts,value)
+				   SELECT incoming.series_id,incoming.ts,incoming.value
+				   FROM tsdb_batch(?) AS incoming
+				   WHERE NOT EXISTS (
+					  SELECT 1 FROM samples
+					  WHERE series_id = incoming.series_id AND ts = incoming.ts
+				   )`;
+			await this.withStatement(insertSql, async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [batch]);
+				await this.sqlite3.step(stmt);
+			});
 			if (insertedRows > 0) {
 				const metadataKnown = await this.incrementKnownMetaNumber(
 					META_SAMPLE_COUNT,
 					insertedRows
 				);
 				if (metadataKnown) {
-					if (oldestInserted !== null) {
-						await this.setMetaMinNumber(
-							META_OLDEST_SAMPLE_MS,
-							oldestInserted
-						);
-					}
-					if (newestInserted !== null) {
-						await this.setMetaMaxNumber(
-							META_NEWEST_SAMPLE_MS,
-							newestInserted
-						);
-					}
+					await this.setMetaMinNumber(
+						META_OLDEST_SAMPLE_MS,
+						oldestBatchTs
+					);
+					await this.setMetaMaxNumber(
+						META_NEWEST_SAMPLE_MS,
+						newestBatchTs
+					);
 					await this.addRollupCounts(bucketCounts);
 				}
 			}
+			await this.withStatement(
+				"INSERT INTO samples(control,arg1,arg2) VALUES('compact-before',?,?)",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [
+						BigInt(Date.now()),
+						TSDB_COMPACTION_LIMIT,
+					]);
+					await this.sqlite3.step(stmt);
+				}
+			);
 			await this.sqlite3.exec(this.db, "COMMIT");
 		} catch (error) {
 			await this.sqlite3.exec(this.db, "ROLLBACK").catch(() => undefined);
@@ -811,11 +817,21 @@ export class MetricsStore implements MetricsStoreLike {
 				: new Map<number, number>();
 			let deletedRows = 0;
 			await this.withStatement(
-				"DELETE FROM samples WHERE ts < ?",
+				"SELECT count(*) FROM samples WHERE ts < ?",
 				async (stmt) => {
 					this.sqlite3.bind_collection(stmt, [Math.floor(cutoffMs)]);
+					if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+						deletedRows = (this.sqlite3.row(stmt)[0] as number) ?? 0;
+					}
+				}
+			);
+			await this.withStatement(
+				"INSERT INTO samples(control,arg1) VALUES('delete-before',?)",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [
+						BigInt(Math.floor(cutoffMs)),
+					]);
 					await this.sqlite3.step(stmt);
-					deletedRows = this.sqlite3.changes(this.db);
 				}
 			);
 			if (deletedRows > 0) {
@@ -1019,17 +1035,33 @@ export class MetricsStore implements MetricsStoreLike {
 	}
 
 	private async finalizePreparedStatements(): Promise<void> {
-		const stmts = [
-			this.insertSeriesStmt,
-			this.insertSampleStmt,
-			this.updateSampleStmt,
-		];
+		const stmts = [this.insertSeriesStmt];
 		this.insertSeriesStmt = null;
-		this.insertSampleStmt = null;
-		this.updateSampleStmt = null;
 		for (const stmt of stmts) {
 			if (stmt !== null) await this.sqlite3.finalize(stmt);
 		}
+	}
+}
+
+interface TsdbWasmModule {
+	ccall(
+		name: string,
+		returnType: string,
+		argumentTypes: string[],
+		arguments_: unknown[]
+	): number;
+}
+
+function registerTsdbExtension(module: unknown): number {
+	const candidate = module as Partial<TsdbWasmModule>;
+	if (typeof candidate.ccall !== "function") {
+		throw new Error("tsdb: custom wa-sqlite module is not installed");
+	}
+	try {
+		return candidate.ccall("sqlite3_tsdb_auto_extension", "number", [], []);
+	} catch (error) {
+		const detail = error instanceof Error ? `: ${error.message}` : "";
+		throw new Error(`tsdb: custom wa-sqlite module is not installed${detail}`);
 	}
 }
 
