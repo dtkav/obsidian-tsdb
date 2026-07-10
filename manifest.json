@@ -1,7 +1,7 @@
 {
 	"id": "tsdb",
 	"name": "TSDB",
-	"version": "1.0.9",
+	"version": "1.0.10",
 	"minAppVersion": "1.13.1",
 	"description": "Local time series database for plugin metrics, embedded PromQL charts, Prometheus scraping, and Prometheus-compatible queries.",
 	"author": "Daniel Grossmann-Kavanagh",
