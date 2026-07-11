@@ -1,101 +1,141 @@
 # TSDB
 
 TSDB is a local time-series database for Obsidian. It records metrics from this
-vault and from other plugins, stores them in a durable SQLite database backed
-by Obsidian's browser storage, and lets notes render live charts with PromQL
-code blocks.
+vault and from other plugins, stores them in SQLite-backed browser storage, and
+renders live charts from PromQL code blocks in notes.
 
-The default path is local and offline: collect metrics, keep history, query the
-local database, and chart the results in Obsidian. Prometheus HTTP serving and
-external endpoint scraping are available under advanced settings.
+The main workflow stays inside Obsidian: collect local metrics, query the local
+database, pin a time range while investigating, and keep dashboards as Markdown
+notes. Prometheus HTTP serving and external endpoint scraping are available in
+advanced settings.
 
 ![TSDB dashboard with global time selector](docs/images/tsdb-dashboard.png)
 
-## What it does
+## Use TSDB in Obsidian
 
-- **Local time-series database**: stores samples in SQLite through `wa-sqlite`.
-  The database runs in a worker and persists in OPFS, Obsidian's
-  browser-managed storage area.
-- **Plugin metric registration**: other plugins register named metric stores
-  with `app.plugins.plugins["tsdb"].api.getStore(...)` or the `tsdb:ready`
-  workspace event.
-- **PromQL queries**: query stored metrics with a practical subset of PromQL,
-  including selectors, aggregations, rates, range functions, binary operators,
-  and `histogram_quantile`.
-- **Embedded charts**: render live time series, stat, and table panels from
-  fenced `promql` code blocks in notes.
-- **Built-in vault metrics**: records file activity, note counts, vault size,
-  enabled plugin count, open note count, note view time, and browser memory when
-  available.
-- **Prometheus interop**: optionally expose a local Prometheus-compatible HTTP
-  server and scrape Prometheus exposition endpoints into the same local store.
+Select the ribbon icon or run **Open metrics dashboard** to view the built-in
+dashboard. Select **Edit in my vault** to create a Markdown dashboard note that
+you can edit like any other note.
 
-## Installation
+TSDB records from these sources:
 
-### Manual installation
+- **Vault metrics**: file operations, note counts, vault size, open notes,
+  enabled plugins, and note view duration.
+- **Performance metrics**: browser memory usage and selected Obsidian API
+  timings.
+- **Plugin metrics**: metrics registered by other Obsidian plugins.
+- **Prometheus scrape targets**: optional external exposition endpoints.
 
-1. Clone this repository into your vault's `.obsidian/plugins/` folder:
+The charting layer, dashboard, and optional HTTP API all query the same local
+database.
 
-   ```bash
-   cd /path/to/your/vault/.obsidian/plugins/
-   git clone https://github.com/dtkav/obsidian-tsdb.git
-   ```
-
-2. Install dependencies and build:
-
-   ```bash
-   cd obsidian-tsdb
-   npm install
-   npm run build:tsdb-wasm
-   npm run build
-   ```
-
-3. Enable **TSDB** in **Settings -> Community plugins**.
-
-## Time-Series Database
+## Storage
 
 TSDB records metric samples into a SQLite database using `wa-sqlite`. The
 database runs in a worker and persists in OPFS (Origin Private File System),
-the browser-managed storage area available to Obsidian's renderer. The plugin
-directory contains the plugin bundle and manifest; metric data lives in OPFS.
+the browser-managed storage area available to Obsidian's renderer.
 
-Each scrape batch is committed as a SQLite transaction, and retention pruning
-removes old samples on a schedule.
+Metric data lives in OPFS, separate from the plugin files.
 
-The local database is the center of the plugin:
+Each scrape batch is committed as a SQLite transaction. Retention pruning keeps
+the database within the configured history window. The default retention is 30
+days; change it in **Settings -> Community plugins -> TSDB -> Database**.
 
-- Built-in metric stores record this vault's own activity.
-- Plugin-provided stores record metrics from other Obsidian plugins.
-- Optional scrape jobs record external Prometheus endpoints.
-- Note charts and dashboards query the database directly, without needing the
-  HTTP server.
+## Charting in notes
 
-The default retention is 30 days. Change it in **Settings -> Community plugins
--> TSDB -> Database**.
+TSDB registers a `promql` Markdown code block processor. Add a fenced block to
+any note and it renders as a live panel backed by the local database.
 
-### Built-in metrics
+### Time series
 
-TSDB creates two built-in stores:
+````markdown
+```promql
+query: sum by (operation) (rate(obsidian_file_operations_total[5m]))
+title: File operations per second
+legend: "{{operation}}"
+range: 3h
+refresh: 30s
+```
+````
 
-- `vault`: file operations, note counts, vault size, open notes, enabled
-  plugins, and note view duration.
-- `performance`: browser memory usage and selected Obsidian API timings.
+### Stat
 
-Examples:
+````markdown
+```promql
+query: obsidian_vault_notes_total
+type: stat
+title: Notes
+refresh: 60s
+```
+````
 
-- `obsidian_file_operations_total`
-- `obsidian_vault_files_total`
-- `obsidian_vault_notes_total`
-- `obsidian_vault_size_bytes`
-- `obsidian_active_notes_count`
-- `obsidian_plugins_enabled_total`
-- `obsidian_note_view_duration_seconds`
-- `obsidian_browser_memory_usage_bytes`
-- `obsidian_app_performance_timing_seconds`
+### Table
 
-All metrics include `vault_name` and `vault_id` labels automatically.
+````markdown
+```promql
+query: scrape_samples_scraped
+type: table
+title: Scrape samples
+refresh: 30s
+```
+````
 
-## Plugin Registration
+Panel options:
+
+- `query`: a PromQL expression.
+- `queries`: multiple expressions with optional `legend` values.
+- `type`: `timeseries`, `stat`, or `table`.
+- `title`: panel title.
+- `range`: time range for time series panels, such as `1h` or `3h`.
+- `step`: query step; omitted means automatic.
+- `refresh`: refresh interval; omitted means render once.
+- `unit`: display unit, including `bytes`.
+- `legend`: label template such as `{{operation}} on {{instance}}`.
+- `min`, `max`, `height`: chart display controls.
+
+## Time range selection
+
+PromQL panels use the active dashboard time range. The selector lives in the
+workspace tab bar, next to Obsidian's view controls, so the same investigation
+window follows you across TSDB dashboard notes.
+
+Dashboard frontmatter can pin a note to a specific query window:
+
+```yaml
+tsdb:
+  time:
+    start: "2026-07-10T23:06:00-07:00"
+    end: "2026-07-10T23:36:00-07:00"
+    step: 1m
+```
+
+Pinned notes still use the global selector UI. The pinned values apply while
+that note is active.
+
+## Querying
+
+The charting layer and dashboard query the local TSDB directly. The same engine
+also powers the optional Prometheus-compatible HTTP API.
+
+Supported PromQL subset:
+
+- Selectors with `=`, `!=`, `=~`, `!~`, range selectors such as `[5m]`, and
+  `offset`.
+- `rate`, `irate`, `increase`, `delta`, `idelta`, `changes`, `resets`, and
+  `*_over_time` functions for avg, min, max, sum, count, last, present,
+  stddev, stdvar, and quantile.
+- `histogram_quantile`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
+  `log2`, `log10`, `sgn`, `clamp`, `clamp_min`, `clamp_max`, `scalar`,
+  `vector`, `time`, `absent`, `sort`, and `sort_desc`.
+- Aggregations: `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`,
+  `quantile`, `topk`, and `bottomk` with `by` and `without`.
+- Binary operators: arithmetic, comparisons including `bool`, `and`, `or`,
+  `unless`, and one-to-one vector matching with `on` and `ignoring`.
+
+Unsupported PromQL features include subqueries, `@` modifiers, `group_left`,
+`group_right`, `label_replace`, and `label_join`.
+
+## Plugin registration
 
 Other plugins register metrics by claiming a named store. A store is recorded
 into the local database at its own interval, and the store name becomes the
@@ -153,8 +193,7 @@ export default class MyPlugin extends Plugin {
 ```
 
 Registration is idempotent. If TSDB reloads, `tsdb:ready` fires again and your
-plugin should recreate its store and metric references. Do not keep old API or
-metric instances across TSDB reloads.
+plugin should recreate its store and metric references.
 
 ### Metric types
 
@@ -193,103 +232,23 @@ api.gauge("active_documents", "Open document count.", 3);
 api.histogram("request_duration_seconds", "Request duration.");
 ```
 
-## Charting In Notes
-
-TSDB registers a `promql` Markdown code block processor. Add a fenced block to
-any note and it renders as a live panel backed by the local database.
-
-### Time series
-
-````markdown
-```promql
-query: sum by (operation) (rate(obsidian_file_operations_total[5m]))
-title: File operations per second
-legend: "{{operation}}"
-range: 3h
-refresh: 30s
-```
-````
-
-### Stat
-
-````markdown
-```promql
-query: obsidian_vault_notes_total
-type: stat
-title: Notes
-refresh: 60s
-```
-````
-
-### Table
-
-````markdown
-```promql
-query: scrape_samples_scraped
-type: table
-title: Scrape samples
-refresh: 30s
-```
-````
-
-Panel options:
-
-- `query`: a PromQL expression.
-- `queries`: multiple expressions with optional `legend` values.
-- `type`: `timeseries`, `stat`, or `table`.
-- `title`: panel title.
-- `range`: time range for time series panels, such as `1h` or `3h`.
-- `step`: query step; omitted means automatic.
-- `refresh`: refresh interval; omitted means render once.
-- `unit`: display unit, including `bytes`.
-- `legend`: label template such as `{{operation}} on {{instance}}`.
-- `min`, `max`, `height`: chart display controls.
-
-Use the ribbon icon or the **Open metrics dashboard** command to open the
-built-in dashboard. Select **Edit in my vault** from that dashboard to create a
-normal Markdown note you can customize.
-
-## Querying
-
-The charting layer and dashboard query the local TSDB directly. The same engine
-also powers the optional Prometheus-compatible HTTP API.
-
-Supported PromQL subset:
-
-- Selectors with `=`, `!=`, `=~`, `!~`, range selectors such as `[5m]`, and
-  `offset`.
-- `rate`, `irate`, `increase`, `delta`, `idelta`, `changes`, `resets`, and
-  `*_over_time` functions for avg, min, max, sum, count, last, present,
-  stddev, stdvar, and quantile.
-- `histogram_quantile`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
-  `log2`, `log10`, `sgn`, `clamp`, `clamp_min`, `clamp_max`, `scalar`,
-  `vector`, `time`, `absent`, `sort`, and `sort_desc`.
-- Aggregations: `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`,
-  `quantile`, `topk`, and `bottomk` with `by` and `without`.
-- Binary operators: arithmetic, comparisons including `bool`, `and`, `or`,
-  `unless`, and one-to-one vector matching with `on` and `ignoring`.
-
-Not supported yet: subqueries, `@` modifiers, `group_left`, `group_right`,
-`label_replace`, and `label_join`.
-
 ## Settings
 
 Open **Settings -> Community plugins -> TSDB**.
 
 Key settings:
 
-- **Metric stores**: enable or disable each local store and set its recording
-  interval.
+- **Sources**: enable or disable local metric sources, set recording intervals,
+  and add Prometheus scrape targets.
 - **Database**: set retention and view the active OPFS database status.
 - **HTTP API**: enable the local Prometheus-compatible server and set the port
   or port range.
-- **Scraping**: add external Prometheus exposition targets.
 - **Advanced**: set the metric prefix.
 
 The HTTP server is disabled by default. Local recording and note charting do
 not require it.
 
-## Advanced: Prometheus Interop
+## Advanced: Prometheus interop
 
 TSDB can both expose a Prometheus-compatible server and scrape Prometheus
 endpoints. These features are optional and use local HTTP by default.
@@ -330,7 +289,7 @@ The same helper exposes `getStats()`, `getScrapeStatuses()`, `query(expr)`, and
 
 ### Scrape Prometheus endpoints
 
-Add scrape jobs in settings with one or more target URLs, such as:
+Add scrape targets in settings with one or more target URLs, such as:
 
 ```text
 http://localhost:9100/metrics
@@ -349,7 +308,32 @@ External scraping is useful when you want Obsidian to keep a local history of a
 nearby app, development service, or machine exporter without running a separate
 Prometheus instance.
 
-## Project Structure
+## Developing this plugin
+
+This plugin directory builds an Obsidian community plugin. The release
+artifacts are `main.js`, `manifest.json`, and `styles.css`.
+
+```bash
+npm install
+npm run build:tsdb-wasm
+npm run build
+npm run dev
+npm test
+```
+
+The Wasm build uses Docker, pins Emscripten and the wa-sqlite source revision,
+and installs the generated `.mjs`/`.wasm` pair into `node_modules`. Builds
+verify that this custom artifact is present before bundling.
+
+Run release checks with:
+
+```bash
+npm run release
+```
+
+`main.js` is a generated release artifact and is ignored by git.
+
+## Project structure
 
 ```text
 tsdb/
@@ -370,29 +354,6 @@ tsdb/
 +-- manifest.json            # Plugin manifest
 +-- package.json             # npm scripts and dependencies
 ```
-
-## Development
-
-```bash
-npm install
-npm run build:tsdb-wasm
-npm run build
-npm run dev
-npm test
-```
-
-The Wasm build uses Docker, pins Emscripten and the wa-sqlite source revision,
-and installs the generated `.mjs`/`.wasm` pair into `node_modules`. Normal
-builds verify that this custom artifact is present before bundling.
-
-Release checks:
-
-```bash
-npm run release
-```
-
-`main.js` is a generated release artifact and is ignored by git. Build it before
-manual installation or release packaging.
 
 ## License
 
