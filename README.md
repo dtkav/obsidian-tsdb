@@ -14,8 +14,8 @@ external endpoint scraping are available under advanced settings.
 ## What it does
 
 - **Local time-series database**: stores samples in SQLite through `wa-sqlite`.
-  The default engine runs in a worker and keeps the database in OPFS, so there
-  is no normal `metrics.sqlite` file in the plugin directory.
+  The database runs in a worker and persists in OPFS, Obsidian's
+  browser-managed storage area.
 - **Plugin metric registration**: other plugins register named metric stores
   with `app.plugins.plugins["tsdb"].api.getStore(...)` or the `tsdb:ready`
   workspace event.
@@ -54,11 +54,10 @@ external endpoint scraping are available under advanced settings.
 
 ## Time-Series Database
 
-TSDB records metric samples into a SQLite database using `wa-sqlite`. By
-default, the database is opened in a worker and stored in OPFS (Origin Private
-File System), the browser-managed storage area available to Obsidian's
-renderer. This means the active database is not a normal vault file and does
-not appear as `metrics.sqlite` under `.obsidian/plugins/tsdb/`.
+TSDB records metric samples into a SQLite database using `wa-sqlite`. The
+database runs in a worker and persists in OPFS (Origin Private File System),
+the browser-managed storage area available to Obsidian's renderer. The plugin
+directory contains the plugin bundle and manifest; metric data lives in OPFS.
 
 Each scrape batch is committed as a SQLite transaction, and retention pruning
 removes old samples on a schedule.

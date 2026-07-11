@@ -59,7 +59,7 @@ npm run check:no-node
 ```
 
 The default storage backend is worker OPFS through `wa-sqlite`. Non-OPFS
-storage paths are fallback/diagnostic paths and should not become the normal
+storage paths are fallback/diagnostic paths and should not become the primary
 desktop or mobile path.
 
 ## Releases
