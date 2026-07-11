@@ -9,6 +9,8 @@ The default path is local and offline: collect metrics, keep history, query the
 local database, and chart the results in Obsidian. Prometheus HTTP serving and
 external endpoint scraping are available under advanced settings.
 
+![TSDB dashboard with global time selector](docs/images/tsdb-dashboard.png)
+
 ## What it does
 
 - **Local time-series database**: stores samples in SQLite through `wa-sqlite`.
