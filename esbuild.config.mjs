@@ -52,9 +52,9 @@ const context = await esbuild.context({
 	entryPoints: ["src/main.ts"],
 	bundle: true,
 	loader: {
-		// Embed the sql.js SQLite WASM binary directly into main.js so the
-		// plugin ships as a single file per Obsidian plugin requirements.
-		".wasm": "binary",
+		// Embed SQLite WASM in main.js but leave it encoded until the deferred
+		// runtime startup. The binary loader would decode it during module load.
+		".wasm": "base64",
 	},
 	define: {
 		"process.env.NODE_ENV": prod ? '"production"' : '"development"',

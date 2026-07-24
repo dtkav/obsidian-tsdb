@@ -57,6 +57,7 @@ export interface WorkerOpfsOpenPlanOptions {
 	pluginDir: string;
 	namespace?: string;
 	probe?: () => Promise<OpfsWorkerProbeResult>;
+	onProbeFailure?: (error: string) => void;
 	logger?: Pick<Console, "warn">;
 }
 
@@ -66,9 +67,11 @@ export async function prepareWorkerOpfsOpenPlan(
 	const probe = options.probe ?? probeOpfsWorker;
 	const probeResult = await probe();
 	if (!probeResult.ok) {
+		const error = probeResult.error ?? "unknown OPFS worker probe error";
+		options.onProbeFailure?.(error);
 		options.logger?.warn(
 			"tsdb: OPFS worker backend unavailable",
-			probeResult.error
+			error
 		);
 		return null;
 	}

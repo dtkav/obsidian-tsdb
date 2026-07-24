@@ -1,7 +1,10 @@
 import type { Labels, Matcher } from "../labels";
+import { PromQLError } from "../promql/ast";
+import type { ApiResultData, PromQLQueryEngine } from "../promql/engine";
 import type {
 	MetricsStoreLike,
 	QuickStoreStats,
+	RetentionDeleteResult,
 	SeriesData,
 	StoredSample,
 	StoreStats,
@@ -13,7 +16,9 @@ import type {
 	WorkerStoreResponse,
 } from "./worker-protocol";
 
-export const WORKER_STORE_CLOSE_TIMEOUT_MS = 2000;
+export const WORKER_STORE_CLOSE_TIMEOUT_MS = 10000;
+export const WORKER_STORE_DRAIN_TIMEOUT_MS = 60000;
+export const WORKER_STORE_OPEN_TIMEOUT_MS = 60000;
 
 export interface WorkerStoreTransport {
 	post(message: WorkerStoreRequest, transfer?: Transferable[]): void;
@@ -31,9 +36,10 @@ interface PendingRequest {
 	reject: (error: Error) => void;
 }
 
-export class WorkerMetricsStore implements MetricsStoreLike {
+export class WorkerMetricsStore implements MetricsStoreLike, PromQLQueryEngine {
 	private nextRequestId = 1;
 	private pending = new Map<number, PendingRequest>();
+	private idleWaiters = new Set<() => void>();
 	private unsubscribe: (() => void) | null;
 	private closing = false;
 	private closed = false;
@@ -53,8 +59,9 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 		const store = new WorkerMetricsStore(transport);
 		const wasmBinary = copyBytes(options.wasmBinary);
 		const transfer: Transferable[] = [wasmBinary.buffer as ArrayBuffer];
+		let timeoutId: number | null = null;
 		try {
-			const result = await store.request<WorkerStoreOpenResult>(
+			const request = store.request<WorkerStoreOpenResult>(
 				{
 					op: "open",
 					dbName: options.dbName,
@@ -62,11 +69,19 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 				},
 				transfer
 			);
+			const timeout = new Promise<never>((_resolve, reject) => {
+				timeoutId = window.setTimeout(() => {
+					reject(new Error("tsdb: worker store open timed out"));
+				}, WORKER_STORE_OPEN_TIMEOUT_MS);
+			});
+			const result = await Promise.race([request, timeout]);
 			store.recovered = result.recoveredFromCorruption;
 			return store;
 		} catch (error) {
 			store.forceClose(error);
 			throw error;
+		} finally {
+			if (timeoutId !== null) window.clearTimeout(timeoutId);
 		}
 	}
 
@@ -126,6 +141,17 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 		return this.request<void>({ op: "deleteBefore", cutoffMs });
 	}
 
+	deleteBeforeBatch(
+		cutoffMs: number,
+		maxSamples: number
+	): Promise<RetentionDeleteResult> {
+		return this.request<RetentionDeleteResult>({
+			op: "deleteBeforeBatch",
+			cutoffMs,
+			maxSamples,
+		});
+	}
+
 	quickStats(): Promise<QuickStoreStats> {
 		return this.request<QuickStoreStats>({ op: "quickStats" });
 	}
@@ -134,13 +160,50 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 		return this.request<StoreStats>({ op: "stats" });
 	}
 
+	instantQuery(query: string, timeMs: number): Promise<ApiResultData> {
+		return this.request<ApiResultData>({ op: "instantQuery", query, timeMs });
+	}
+
+	rangeQuery(
+		query: string,
+		startMs: number,
+		endMs: number,
+		stepMs: number
+	): Promise<ApiResultData> {
+		return this.request<ApiResultData>({
+			op: "rangeQuery",
+			query,
+			startMs,
+			endMs,
+			stepMs,
+		});
+	}
+
 	close(): Promise<void> {
 		if (this.closePromise) return this.closePromise;
 		if (this.closed) return Promise.resolve();
 		this.closing = true;
+		this.closePromise = this.closeAfterPendingRequests();
+		return this.closePromise;
+	}
+
+	private async closeAfterPendingRequests(): Promise<void> {
+		if (this.pending.size > 0) {
+			const drained = await this.waitForIdle(WORKER_STORE_DRAIN_TIMEOUT_MS);
+			if (!drained) {
+				console.warn(
+					"tsdb: worker store drain timed out; terminating worker"
+				);
+				this.forceClose(new Error("tsdb: worker store drain timed out"));
+				return;
+			}
+		}
+
 		const closeRequest = this.request<void>({ op: "close" }, undefined, true).catch(
 			(error) => {
-				console.warn("tsdb: worker store close failed", error);
+				if (!this.closed) {
+					console.warn("tsdb: worker store close failed", error);
+				}
 			}
 		);
 		let timeoutId: number | null = null;
@@ -150,11 +213,32 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 				resolve();
 			}, WORKER_STORE_CLOSE_TIMEOUT_MS);
 		});
-		this.closePromise = Promise.race([closeRequest, timeout]).then(() => {
-			if (timeoutId !== null) window.clearTimeout(timeoutId);
-			this.forceClose(new Error("tsdb: worker store closed"));
+		await Promise.race([closeRequest, timeout]);
+		if (timeoutId !== null) window.clearTimeout(timeoutId);
+		this.forceClose(new Error("tsdb: worker store closed"));
+	}
+
+	private waitForIdle(timeoutMs: number): Promise<boolean> {
+		if (this.pending.size === 0) return Promise.resolve(true);
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			const finish = (idle: boolean) => {
+				if (settled) return;
+				settled = true;
+				this.idleWaiters.delete(onIdle);
+				window.clearTimeout(timeoutId);
+				resolve(idle);
+			};
+			const onIdle = () => finish(true);
+			const timeoutId = window.setTimeout(() => finish(false), timeoutMs);
+			this.idleWaiters.add(onIdle);
 		});
-		return this.closePromise;
+	}
+
+	private notifyIdle(): void {
+		if (this.pending.size > 0) return;
+		for (const resolve of this.idleWaiters) resolve();
+		this.idleWaiters.clear();
 	}
 
 	private request<T>(
@@ -185,10 +269,15 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 		const pending = this.pending.get(response.id);
 		if (!pending) return;
 		this.pending.delete(response.id);
+		this.notifyIdle();
 		if (response.ok) {
 			pending.resolve(response.value);
 		} else {
-			pending.reject(new Error(response.error));
+			pending.reject(
+				response.errorType
+					? new PromQLError(response.error, response.errorType)
+					: new Error(response.error)
+			);
 		}
 	}
 
@@ -203,6 +292,7 @@ export class WorkerMetricsStore implements MetricsStoreLike {
 			pending.reject(error);
 		}
 		this.pending.clear();
+		this.notifyIdle();
 		this.transport.close();
 	}
 }

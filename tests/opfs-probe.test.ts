@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	OPFS_WORKER_PROBE_SOURCE,
+	OPFS_WORKER_PROBE_TIMEOUT_MS,
 	OpfsProbeWorkerLike,
 	OpfsWorkerProbeMessage,
 	probeOpfsWorker,
@@ -47,6 +48,10 @@ class FakeProbeWorker implements OpfsProbeWorkerLike {
 }
 
 describe("probeOpfsWorker", () => {
+	it("allows a busy Obsidian runtime time to answer by default", () => {
+		expect(OPFS_WORKER_PROBE_TIMEOUT_MS).toBe(5000);
+	});
+
 	it("probes OPFS sync access handles in an inline worker", async () => {
 		let source = "";
 		const worker = new FakeProbeWorker({ id: 1, ok: true });

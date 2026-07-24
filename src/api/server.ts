@@ -1,5 +1,5 @@
 import { PromQLError, parseDuration } from "../promql/ast";
-import { PromQLEngine } from "../promql/engine";
+import type { PromQLQueryEngine } from "../promql/engine";
 import { parseSeriesSelector } from "../promql/parser";
 import type { MetricsStoreLike } from "../storage/store";
 import { Matcher } from "../labels";
@@ -23,7 +23,7 @@ const { URL, URLSearchParams } = nodeRequire("url") as UrlModule;
 export interface ApiServerDeps {
 	/** Text exposition of the live prom-client registry (the /metrics page). */
 	getExposition: () => Promise<string>;
-	engine: PromQLEngine;
+	engine: PromQLQueryEngine;
 	store: MetricsStoreLike;
 	getHealth: () => ApiHealthStatus;
 	getMetricsPath: () => string;

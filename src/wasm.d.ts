@@ -1,5 +1,5 @@
-// esbuild's "binary" loader turns .wasm imports into a Uint8Array.
+// esbuild's "base64" loader keeps .wasm imports encoded until runtime startup.
 declare module "*.wasm" {
-	const content: Uint8Array;
+	const content: string;
 	export default content;
 }

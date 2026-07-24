@@ -1,6 +1,6 @@
 import { MarkdownRenderChild, parseYaml } from "obsidian";
 import uPlot from "uplot";
-import { ApiResultData, PromQLEngine } from "../promql/engine";
+import type { ApiResultData, PromQLQueryEngine } from "../promql/engine";
 import { PanelConfig, parsePanelConfig } from "./config";
 import {
 	alignMatrix,
@@ -38,7 +38,7 @@ function activePalette(): string[] {
 }
 
 export interface PanelHost {
-	engine: PromQLEngine | null;
+	engine: PromQLQueryEngine | null;
 	timeContext: TimeContext;
 	isUnloading?: boolean;
 	getHealthStatus?: () => ApiHealthStatus;
@@ -197,7 +197,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	// -- timeseries ----------------------------------------------------------
 
 	private async renderTimeseries(
-		engine: PromQLEngine,
+		engine: PromQLQueryEngine,
 		config: PanelConfig,
 		body: HTMLElement
 	): Promise<void> {
@@ -312,7 +312,7 @@ export class PromQLPanel extends MarkdownRenderChild {
 	// -- stat / table ----------------------------------------------------------
 
 	private async renderInstant(
-		engine: PromQLEngine,
+		engine: PromQLQueryEngine,
 		config: PanelConfig,
 		body: HTMLElement
 	): Promise<void> {

@@ -13,8 +13,8 @@
  *
  * ## Handling Plugin Load Order
  *
- * The TSDB plugin emits 'tsdb:ready' when loaded. Listen for this
- * event to handle cases where your plugin loads before TSDB:
+ * The TSDB plugin emits 'tsdb:ready' after the workspace and database are
+ * ready. Listen for this event to handle startup and plugin load order:
  *
  * ```typescript
  * class MyPlugin extends Plugin {
@@ -163,7 +163,8 @@ export interface IObsidianMetricsAPI {
 
 /** Type for the TSDB plugin instance */
 export interface ObsidianMetricsPlugin {
-	api: IObsidianMetricsRootAPI;
+	/** Undefined until the deferred database startup has completed. */
+	api?: IObsidianMetricsRootAPI;
 }
 
 /** Augment Obsidian's workspace events to include our custom event */

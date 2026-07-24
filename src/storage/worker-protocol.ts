@@ -1,6 +1,8 @@
 import type { Labels, Matcher } from "../labels";
+import type { ApiResultData } from "../promql/engine";
 import type {
 	QuickStoreStats,
+	RetentionDeleteResult,
 	SeriesData,
 	StoredSample,
 	StoreStats,
@@ -35,8 +37,21 @@ export type WorkerStoreRequest =
 			matchers?: Matcher[];
 	  }>
 	| WithRequestId<{ op: "deleteBefore"; cutoffMs: number }>
+	| WithRequestId<{
+			op: "deleteBeforeBatch";
+			cutoffMs: number;
+			maxSamples: number;
+	  }>
 	| WithRequestId<{ op: "quickStats" }>
 	| WithRequestId<{ op: "stats" }>
+	| WithRequestId<{ op: "instantQuery"; query: string; timeMs: number }>
+	| WithRequestId<{
+			op: "rangeQuery";
+			query: string;
+			startMs: number;
+			endMs: number;
+			stepMs: number;
+	  }>
 	| WithRequestId<{ op: "close" }>;
 
 export type WorkerStoreRequestBody = WorkerStoreRequest extends infer Request
@@ -56,8 +71,10 @@ export type WorkerStoreResult =
 	| Labels[]
 	| string[]
 	| QuickStoreStats
-	| StoreStats;
+	| RetentionDeleteResult
+	| StoreStats
+	| ApiResultData;
 
 export type WorkerStoreResponse =
 	| { id: number; ok: true; value: WorkerStoreResult }
-	| { id: number; ok: false; error: string };
+	| { id: number; ok: false; error: string; errorType?: string };

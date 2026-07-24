@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	WORKER_STORE_CLOSE_TIMEOUT_MS,
+	WORKER_STORE_DRAIN_TIMEOUT_MS,
+	WORKER_STORE_OPEN_TIMEOUT_MS,
 	WorkerMetricsStore,
 	WorkerStoreTransport,
 } from "../src/storage/worker-store";
@@ -46,8 +48,12 @@ class FakeTransport implements WorkerStoreTransport {
 		this.listener?.({ id, ok: true, value });
 	}
 
-	reject(id: number, error: string): void {
-		this.listener?.({ id, ok: false, error });
+	reject(id: number, error: string, errorType?: string): void {
+		this.listener?.(
+			errorType
+				? { id, ok: false, error, errorType }
+				: { id, ok: false, error }
+		);
 	}
 }
 
@@ -95,6 +101,21 @@ describe("WorkerMetricsStore", () => {
 		const store = await opening;
 		expect(store.recoveredFromCorruption).toBe(true);
 		expect(store.isOpen).toBe(true);
+	});
+
+	it("terminates the worker when opening does not answer", async () => {
+		vi.useFakeTimers();
+		const transport = new FakeTransport();
+		const opening = WorkerMetricsStore.open(transport, {
+			dbName: "metrics",
+			wasmBinary: new Uint8Array([1]),
+		});
+		const rejectedOpening = expect(opening).rejects.toThrow(/open timed out/);
+
+		await vi.advanceTimersByTimeAsync(WORKER_STORE_OPEN_TIMEOUT_MS);
+		await rejectedOpening;
+
+		expect(transport.closed).toBe(true);
 	});
 
 	it("forwards store operations and resolves matching response ids", async () => {
@@ -167,6 +188,87 @@ describe("WorkerMetricsStore", () => {
 		expect(store.isOpen).toBe(true);
 	});
 
+	it("forwards PromQL queries and receives only evaluated results", async () => {
+		const { store, transport } = await openStore();
+		const instantResult = {
+			resultType: "vector" as const,
+			result: [
+				{
+					metric: { __name__: "requests_total" },
+					value: [1, "2"] as [number, string],
+				},
+			],
+		};
+
+		const instant = store.instantQuery("requests_total", 1000);
+		let message = transport.last();
+		expect(message).toMatchObject({
+			op: "instantQuery",
+			query: "requests_total",
+			timeMs: 1000,
+		});
+		transport.resolve(message.id, instantResult);
+		expect(await instant).toEqual(instantResult);
+
+		const rangeResult = {
+			resultType: "matrix" as const,
+			result: [
+				{
+					metric: { __name__: "requests_total" },
+					values: [
+						[1, "2"],
+						[2, "3"],
+					] as Array<[number, string]>,
+				},
+			],
+		};
+		const range = store.rangeQuery("rate(requests_total[1m])", 1000, 2000, 1000);
+		message = transport.last();
+		expect(message).toMatchObject({
+			op: "rangeQuery",
+			query: "rate(requests_total[1m])",
+			startMs: 1000,
+			endMs: 2000,
+			stepMs: 1000,
+		});
+		transport.resolve(message.id, rangeResult);
+		expect(await range).toEqual(rangeResult);
+	});
+
+	it("forwards bounded retention requests", async () => {
+		const { store, transport } = await openStore();
+		const deleting = store.deleteBeforeBatch(10_000, 100_000);
+		const message = transport.last();
+		expect(message).toMatchObject({
+			op: "deleteBeforeBatch",
+			cutoffMs: 10_000,
+			maxSamples: 100_000,
+		});
+		transport.resolve(message.id, {
+			complete: false,
+			cutoffMs: 5000,
+			deletedSamples: 100_000,
+		});
+
+		expect(await deleting).toEqual({
+			complete: false,
+			cutoffMs: 5000,
+			deletedSamples: 100_000,
+		});
+	});
+
+	it("preserves PromQL error types across the worker boundary", async () => {
+		const { store, transport } = await openStore();
+		const query = store.instantQuery("sum(", 1000);
+		const message = transport.last();
+		transport.reject(message.id, "unexpected end of expression", "bad_data");
+
+		await expect(query).rejects.toMatchObject({
+			name: "PromQLError",
+			errorType: "bad_data",
+		});
+	});
+
 	it("closes the worker transport and rejects later operations", async () => {
 		const { store, transport } = await openStore();
 
@@ -179,6 +281,48 @@ describe("WorkerMetricsStore", () => {
 
 		expect(transport.closed).toBe(true);
 		await expect(store.stats()).rejects.toThrow(/closing/);
+	});
+
+	it("waits for pending operations before starting the close request", async () => {
+		vi.useFakeTimers();
+		const { store, transport } = await openStore();
+		const sample = {
+			labels: { __name__: "requests_total" },
+			ts: 1000,
+			value: 1,
+		};
+
+		const ingesting = store.ingest([sample]);
+		const ingestMessage = transport.last();
+		const closing = store.close();
+
+		await vi.advanceTimersByTimeAsync(WORKER_STORE_CLOSE_TIMEOUT_MS);
+		expect(transport.last()).toBe(ingestMessage);
+		expect(transport.closed).toBe(false);
+
+		transport.resolve(ingestMessage.id);
+		await ingesting;
+		const closeMessage = transport.last();
+		expect(closeMessage.op).toBe("close");
+		transport.resolve(closeMessage.id);
+		await closing;
+
+		expect(transport.closed).toBe(true);
+	});
+
+	it("terminates the worker when pending operations do not drain", async () => {
+		vi.useFakeTimers();
+		const { store, transport } = await openStore();
+
+		const stats = store.stats();
+		const rejectedStats = expect(stats).rejects.toThrow(/drain timed out/);
+		const closing = store.close();
+
+		await vi.advanceTimersByTimeAsync(WORKER_STORE_DRAIN_TIMEOUT_MS);
+		await closing;
+		await rejectedStats;
+
+		expect(transport.closed).toBe(true);
 	});
 
 	it("terminates the worker when close does not answer", async () => {

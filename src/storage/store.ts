@@ -17,6 +17,7 @@ import {
 } from "./opfs-vfs";
 import { TsdbBatchRow, encodeTsdbBatch } from "./tsdb-batch";
 import { decodeTsdbBlock } from "./tsdb-block";
+import { installAwaitedStatementFinalization } from "./sqlite-statements";
 
 export interface Point {
 	/** Unix milliseconds. */
@@ -60,6 +61,15 @@ export interface QuickStoreStats {
 	samplesLastHour: number | null;
 }
 
+export interface RetentionDeleteResult {
+	/** True when the requested cutoff was reached. */
+	complete: boolean;
+	/** Six-hour-aligned exclusive cutoff used by this bounded batch. */
+	cutoffMs: number;
+	/** Physical hot rows and compressed-block samples removed by this batch. */
+	deletedSamples: number | null;
+}
+
 export interface OpenOptions {
 	/** Embedded wasm binary; omitted in tests (loaded from disk). */
 	wasmBinary?: ArrayBuffer | Uint8Array;
@@ -87,6 +97,10 @@ export interface MetricsStoreLike {
 	labelNames(matchers?: Matcher[]): Promise<string[]>;
 	labelValues(labelName: string, matchers?: Matcher[]): Promise<string[]>;
 	deleteBefore(cutoffMs: number): Promise<void>;
+	deleteBeforeBatch(
+		cutoffMs: number,
+		maxSamples: number
+	): Promise<RetentionDeleteResult>;
 	quickStats(): Promise<QuickStoreStats>;
 	stats(): Promise<StoreStats>;
 	close(): Promise<void>;
@@ -242,6 +256,7 @@ export class MetricsStore implements MetricsStoreLike {
 				);
 			}
 			const sqlite3 = SQLite.Factory(module);
+			installAwaitedStatementFinalization(sqlite3);
 			const vfsName = vfsNameForLocation(options.location);
 			const vfs = createVfs(vfsName, options.location, dbName) as SQLiteVFS &
 				CloseableVfs;
@@ -304,7 +319,9 @@ export class MetricsStore implements MetricsStoreLike {
 		await this.loadSeriesCache();
 		await this.initializeStatsMetadata();
 		const now = Date.now();
-		await this.compactBefore(now);
+		// Opening the database must stay responsive even when historical hot
+		// data has accumulated. Compaction remains an ingest-time maintenance
+		// task at the next block boundary instead of delaying store readiness.
 		this.nextCompactionMs = nextBlockBoundary(now);
 	}
 
@@ -502,16 +519,14 @@ export class MetricsStore implements MetricsStoreLike {
 		let newest: number | null = null;
 		await this.sqlite3.exec(
 			this.db,
-			"SELECT ts FROM samples ORDER BY ts ASC LIMIT 1",
+			`SELECT min(first_ts), max(last_ts) FROM (
+				SELECT min(ts) AS first_ts, max(ts) AS last_ts FROM samples_head
+				UNION ALL
+				SELECT min(min_ts) AS first_ts, max(max_ts) AS last_ts FROM samples_blocks
+			)`,
 			(row) => {
-				oldest = row[0] as number;
-			}
-		);
-		await this.sqlite3.exec(
-			this.db,
-			"SELECT ts FROM samples ORDER BY ts DESC LIMIT 1",
-			(row) => {
-				newest = row[0] as number;
+				oldest = row[0] as number | null;
+				newest = row[1] as number | null;
 			}
 		);
 		if (oldest === null || newest === null) {
@@ -541,44 +556,70 @@ export class MetricsStore implements MetricsStoreLike {
 		);
 	}
 
-	private async subtractRollupCounts(
-		bucketCounts: Map<number, number>
-	): Promise<void> {
-		if (bucketCounts.size === 0) return;
+	private async collectRetentionCounts(cutoffMs: number): Promise<{
+		deletedRows: number;
+		cutoffBucketMs: number;
+		partialBucketRows: number;
+	}> {
+		const cutoff = Math.floor(cutoffMs);
+		const cutoffBucketMs = bucketStart(cutoff);
+		let deletedRows = 0;
 		await this.withStatement(
-			"UPDATE sample_rollup_1m SET sample_count = max(0, sample_count - ?) WHERE bucket_ms = ?",
+			"SELECT coalesce(sum(sample_count), 0) FROM sample_rollup_1m WHERE bucket_ms < ?",
 			async (stmt) => {
-				for (const [bucketMs, count] of bucketCounts) {
-					this.sqlite3.bind_collection(stmt, [count, bucketMs]);
-					await this.sqlite3.step(stmt);
-					await this.resetPreparedStatement(stmt);
+				this.sqlite3.bind_collection(stmt, [cutoffBucketMs]);
+				if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+					deletedRows = (this.sqlite3.row(stmt)[0] as number) ?? 0;
 				}
 			}
 		);
-		await this.sqlite3.exec(
-			this.db,
-			"DELETE FROM sample_rollup_1m WHERE sample_count <= 0"
-		);
+
+		let partialBucketRows = 0;
+		if (cutoff > cutoffBucketMs) {
+			await this.withStatement(
+				"SELECT count(*) FROM samples WHERE ts >= ? AND ts < ?",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [cutoffBucketMs, cutoff]);
+					if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+						partialBucketRows = (this.sqlite3.row(stmt)[0] as number) ?? 0;
+					}
+				}
+			);
+		}
+		return {
+			deletedRows: deletedRows + partialBucketRows,
+			cutoffBucketMs,
+			partialBucketRows,
+		};
 	}
 
-	private async collectRollupCountsBefore(
-		cutoffMs: number
-	): Promise<Map<number, number>> {
-		const bucketCounts = new Map<number, number>();
+	private async deleteRetentionRollupCounts(
+		cutoffBucketMs: number,
+		partialBucketRows: number
+	): Promise<void> {
 		await this.withStatement(
-			"SELECT ts - (ts % ?), count(*) FROM samples WHERE ts < ? GROUP BY 1",
+			"DELETE FROM sample_rollup_1m WHERE bucket_ms < ?",
 			async (stmt) => {
-				this.sqlite3.bind_collection(stmt, [
-					ROLLUP_BUCKET_MS,
-					Math.floor(cutoffMs),
-				]);
-				while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
-					const row = this.sqlite3.row(stmt);
-					bucketCounts.set(row[0] as number, row[1] as number);
-				}
+				this.sqlite3.bind_collection(stmt, [cutoffBucketMs]);
+				await this.sqlite3.step(stmt);
 			}
 		);
-		return bucketCounts;
+		if (partialBucketRows > 0) {
+			await this.withStatement(
+				"UPDATE sample_rollup_1m SET sample_count = max(0, sample_count - ?) WHERE bucket_ms = ?",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [
+						partialBucketRows,
+						cutoffBucketMs,
+					]);
+					await this.sqlite3.step(stmt);
+				}
+			);
+			await this.sqlite3.exec(
+				this.db,
+				"DELETE FROM sample_rollup_1m WHERE sample_count <= 0"
+			);
+		}
 	}
 
 	private async createMissingSeries(rows: IngestRow[]): Promise<void> {
@@ -851,27 +892,185 @@ export class MetricsStore implements MetricsStoreLike {
 
 	/** Delete samples older than the cutoff; prune series left empty. */
 	deleteBefore(cutoffMs: number): Promise<void> {
-		return this.enqueue(() => this.deleteBeforeLocked(cutoffMs));
+		return this.enqueue(async () => {
+			await this.deleteBeforeLocked(cutoffMs);
+		});
 	}
 
-	private async deleteBeforeLocked(cutoffMs: number): Promise<void> {
+	deleteBeforeBatch(
+		cutoffMs: number,
+		maxSamples: number
+	): Promise<RetentionDeleteResult> {
+		return this.enqueue(() =>
+			this.deleteBeforeBatchLocked(cutoffMs, maxSamples)
+		);
+	}
+
+	private async deleteBeforeBatchLocked(
+		cutoffMs: number,
+		maxSamples: number
+	): Promise<RetentionDeleteResult> {
+		const targetCutoffMs = Math.floor(cutoffMs / TSDB_BLOCK_SPAN_MS) *
+			TSDB_BLOCK_SPAN_MS;
+		const limit = Math.max(1, Math.floor(maxSamples));
+		if (targetCutoffMs <= 0) {
+			return { complete: true, cutoffMs: targetCutoffMs, deletedSamples: 0 };
+		}
+
+		type BlockKey = {
+			seriesId: number;
+			bucketStartMs: number;
+			chunkNo: number;
+			sampleCount: number;
+		};
+		const blocks: BlockKey[] = [];
+		let deletedSamples = 0;
+		await this.withStatement(
+			`SELECT series_id, bucket_start_ms, chunk_no, sample_count
+			 FROM samples_blocks WHERE max_ts < ? ORDER BY max_ts, series_id`,
+			async (stmt) => {
+				this.sqlite3.bind_collection(stmt, [targetCutoffMs]);
+				while ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
+					const row = this.sqlite3.row(stmt);
+					const sampleCount = (row[3] as number) ?? 0;
+					if (blocks.length > 0 && deletedSamples + sampleCount > limit) break;
+					blocks.push({
+						seriesId: row[0] as number,
+						bucketStartMs: row[1] as number,
+						chunkNo: row[2] as number,
+						sampleCount,
+					});
+					deletedSamples += sampleCount;
+					if (deletedSamples >= limit) break;
+				}
+			}
+		);
+		if (blocks.length === 0) {
+			let hasExpiredHead = false;
+			await this.withStatement(
+				"SELECT 1 FROM samples_head WHERE ts < ? LIMIT 1",
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [targetCutoffMs]);
+					hasExpiredHead =
+						(await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW;
+				}
+			);
+			if (!hasExpiredHead) {
+				return {
+					complete: true,
+					cutoffMs: targetCutoffMs,
+					deletedSamples: 0,
+				};
+			}
+		}
+
+		await this.sqlite3.exec(this.db, "BEGIN");
+		try {
+			if (blocks.length > 0) {
+				await this.withStatement(
+					`DELETE FROM samples_blocks
+					 WHERE series_id = ? AND bucket_start_ms = ? AND chunk_no = ?`,
+					async (stmt) => {
+						for (const block of blocks) {
+							this.sqlite3.bind_collection(stmt, [
+								block.seriesId,
+								block.bucketStartMs,
+								block.chunkNo,
+							]);
+							await this.sqlite3.step(stmt);
+							await this.resetPreparedStatement(stmt);
+						}
+					}
+				);
+			}
+
+			const remaining = Math.max(0, limit - deletedSamples);
+			if (remaining > 0) {
+				await this.withStatement(
+					`DELETE FROM samples_head WHERE (series_id, ts) IN (
+						SELECT series_id, ts FROM samples_head
+						WHERE ts < ? ORDER BY ts, series_id LIMIT ?
+					)`,
+					async (stmt) => {
+						this.sqlite3.bind_collection(stmt, [targetCutoffMs, remaining]);
+						await this.sqlite3.step(stmt);
+					}
+				);
+				deletedSamples += this.sqlite3.changes(this.db);
+			}
+
+			let hasMore = false;
+			await this.withStatement(
+				`SELECT 1 FROM samples_head WHERE ts < ?
+				 UNION ALL
+				 SELECT 1 FROM samples_blocks WHERE max_ts < ? LIMIT 1`,
+				async (stmt) => {
+					this.sqlite3.bind_collection(stmt, [
+						targetCutoffMs,
+						targetCutoffMs,
+					]);
+					hasMore = (await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW;
+				}
+			);
+
+			if (!hasMore) {
+				const hasRollups =
+					(await this.getMetaNumber(META_ROLLUP_1M_STARTED_MS)) !== null;
+				const retentionCounts = hasRollups
+					? await this.collectRetentionCounts(targetCutoffMs)
+					: null;
+				if (retentionCounts && retentionCounts.deletedRows > 0) {
+					const metadataKnown = await this.incrementKnownMetaNumber(
+						META_SAMPLE_COUNT,
+						-retentionCounts.deletedRows
+					);
+					if (metadataKnown) await this.refreshKnownSampleBounds();
+				}
+				await this.withStatement(
+					"DELETE FROM sample_rollup_1m WHERE bucket_ms < ?",
+					async (stmt) => {
+						this.sqlite3.bind_collection(stmt, [targetCutoffMs]);
+						await this.sqlite3.step(stmt);
+					}
+				);
+				await this.sqlite3.exec(
+					this.db,
+					`DELETE FROM series WHERE id NOT IN (
+						SELECT series_id FROM samples_head
+						UNION
+						SELECT series_id FROM samples_blocks
+					)`
+				);
+			}
+			await this.sqlite3.exec(this.db, "COMMIT");
+			if (!hasMore) {
+				await this.loadSeriesCache();
+				await this.sqlite3.exec(
+					this.db,
+					`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`
+				);
+			}
+			return {
+				complete: !hasMore,
+				cutoffMs: targetCutoffMs,
+				deletedSamples,
+			};
+		} catch (error) {
+			await this.sqlite3.exec(this.db, "ROLLBACK").catch(() => undefined);
+			throw error;
+		}
+	}
+
+	private async deleteBeforeLocked(cutoffMs: number): Promise<number | null> {
+		let deletedSamples: number | null = null;
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
 			const hasRollups =
 				(await this.getMetaNumber(META_ROLLUP_1M_STARTED_MS)) !== null;
-			const deletedBuckets = hasRollups
-				? await this.collectRollupCountsBefore(cutoffMs)
-				: new Map<number, number>();
-			let deletedRows = 0;
-			await this.withStatement(
-				"SELECT count(*) FROM samples WHERE ts < ?",
-				async (stmt) => {
-					this.sqlite3.bind_collection(stmt, [Math.floor(cutoffMs)]);
-					if ((await this.sqlite3.step(stmt)) === SQLite.SQLITE_ROW) {
-						deletedRows = (this.sqlite3.row(stmt)[0] as number) ?? 0;
-					}
-				}
-			);
+			const retentionCounts = hasRollups
+				? await this.collectRetentionCounts(cutoffMs)
+				: null;
+			deletedSamples = retentionCounts?.deletedRows ?? null;
 			await this.withStatement(
 				"INSERT INTO samples(control,arg1) VALUES('delete-before',?)",
 				async (stmt) => {
@@ -881,19 +1080,28 @@ export class MetricsStore implements MetricsStoreLike {
 					await this.sqlite3.step(stmt);
 				}
 			);
-			if (deletedRows > 0) {
+			if (retentionCounts) {
+				await this.deleteRetentionRollupCounts(
+					retentionCounts.cutoffBucketMs,
+					retentionCounts.partialBucketRows
+				);
+			}
+			if (retentionCounts && retentionCounts.deletedRows > 0) {
 				const metadataKnown = await this.incrementKnownMetaNumber(
 					META_SAMPLE_COUNT,
-					-deletedRows
+					-retentionCounts.deletedRows
 				);
 				if (metadataKnown) {
 					await this.refreshKnownSampleBounds();
-					if (hasRollups) await this.subtractRollupCounts(deletedBuckets);
 				}
 			}
 			await this.sqlite3.exec(
 				this.db,
-				"DELETE FROM series WHERE id NOT IN (SELECT DISTINCT series_id FROM samples)"
+				`DELETE FROM series WHERE id NOT IN (
+					SELECT series_id FROM samples_head
+					UNION
+					SELECT series_id FROM samples_blocks
+				)`
 			);
 			await this.sqlite3.exec(this.db, "COMMIT");
 		} catch (error) {
@@ -905,6 +1113,7 @@ export class MetricsStore implements MetricsStoreLike {
 			this.db,
 			`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`
 		);
+		return deletedSamples;
 	}
 
 	stats(): Promise<StoreStats> {
@@ -1068,10 +1277,21 @@ export class MetricsStore implements MetricsStoreLike {
 		this.closing = true;
 		this.closePromise = this.queue
 			.then(async () => {
-				await this.finalizePreparedStatements();
-				await this.sqlite3.close(this.db);
-				await this.vfs?.close?.();
-				this.vfs = null;
+				let closeError: unknown = null;
+				try {
+					await this.finalizePreparedStatements();
+					await this.sqlite3.close(this.db);
+				} catch (error) {
+					closeError = error;
+				}
+				try {
+					await this.vfs?.close?.();
+				} catch (error) {
+					if (closeError === null) closeError = error;
+				} finally {
+					this.vfs = null;
+				}
+				if (closeError !== null) throw closeError;
 			})
 			.then(
 				() => {

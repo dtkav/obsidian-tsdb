@@ -51,10 +51,22 @@ The plugin is organized around these boundaries:
 - `src/panels/` owns rendering fenced `promql` code blocks in notes.
 - `sqlite-tsdb/` owns the custom SQLite extension.
 
+## Startup lifecycle
+
+`Plugin.onload()` only registers lightweight Obsidian surfaces such as commands,
+views, settings, and Markdown processors. Runtime initialization starts from
+`Workspace.onLayoutReady`, so SQLite/Wasm initialization, vault metric scans,
+scraping, retention, and panel refreshes do not block Obsidian's plugin loader.
+The embedded Wasm stays base64-encoded until this deferred startup begins.
+
+The public `api` is assigned and `tsdb:ready` is emitted only after the local
+database and scraper are ready. Unload waits for any in-progress deferred
+initialization before closing the database and other runtime resources.
+
 ## Data flow
 
 1. A metric source is registered.
-   - Built-in sources are registered during plugin load.
+   - Built-in sources are registered during deferred runtime initialization.
    - Other plugins call `plugin.api.getStore(name, options)`.
    - Prometheus scrape targets are configured in settings.
 
@@ -75,16 +87,18 @@ The plugin is organized around these boundaries:
    - The WAL is a replay source only when storage has to be recreated after
      unreadable or corrupt database state.
 
-5. Queries read through `PromQLEngine`.
-   - Panels query the store directly.
-   - The optional HTTP API uses the same engine.
+5. Queries read through `PromQLQueryEngine`.
+   - The worker-OPFS backend evaluates PromQL beside SQLite and sends only the
+     final vector or matrix back to the renderer.
+   - Fallback backends use the same engine in process.
+   - Panels and the optional HTTP API share this query surface.
    - Prometheus is not required for note rendering.
 
 ## Metric registration
 
-The public plugin API exposes named metric stores. Plugins can access it from
-`app.plugins.plugins["tsdb"].api` after TSDB is loaded, or by listening for the
-`tsdb:ready` workspace event:
+The public plugin API exposes named metric stores. Plugins should listen for the
+`tsdb:ready` workspace event. They can also use
+`app.plugins.plugins["tsdb"].api` when it is already defined:
 
 ```ts
 const api = app.plugins.plugins["tsdb"].api.getStore("my-plugin", {
@@ -120,7 +134,9 @@ Built-in stores use the same mechanism:
 TSDB registers a Markdown code block processor for fenced `promql` blocks.
 Each block is parsed as either a bare PromQL expression or a YAML panel
 configuration. The panel resolves its time range, expands time macros, queries
-`PromQLEngine`, and renders the result with uPlot.
+`PromQLQueryEngine`, and renders the result with uPlot. Auto step selection
+targets roughly 250 output points; raw samples needed for functions such as
+`rate()` remain inside the OPFS worker.
 
 Panels subscribe to the global time context. The global time selector appears
 only when the active note contains a `promql` block. Note frontmatter can
@@ -423,8 +439,8 @@ ORDER BY series_id, pack_chunk;
 
 `tsdb_pack` sorts the aggregate input by timestamp, rejects duplicate
 timestamps, and returns an `STB1` blob. The 65,536-point chunks bound aggregate
-memory use and keep worker responses large enough to be efficient but small
-enough to handle predictably.
+memory use. On worker OPFS, those packed chunks are decoded and evaluated in
+the worker; only the final PromQL result crosses to the renderer.
 
 ### Compaction
 
@@ -437,8 +453,8 @@ enough to handle predictably.
 4. Replaces cold block rows for that bucket.
 5. Deletes the compacted hot rows.
 
-`MetricsStore` runs compaction at startup and at six-hour boundaries rather
-than after every scrape.
+`MetricsStore` runs bounded compaction during ingestion at six-hour boundaries
+rather than during database open or after every scrape.
 
 ### Retention
 
@@ -450,8 +466,15 @@ than after every scrape.
 4. The plugin prunes series that no longer have samples.
 5. SQLite incremental vacuum runs in bounded chunks.
 
-This makes retention mostly proportional to the number of affected blocks, not
-the number of retained rows.
+The plugin aligns the retention cutoff to a six-hour block boundary, then
+advances toward it in batches bounded by physical hot rows and compressed-block
+sample counts. This can retain up to one extra partial block, avoiding expensive
+block rewrites. A pause between batches lets queries and ingests use the worker
+queue. Metadata maintenance reads minute rollups and hot/cold shadow-table
+bounds rather than decoding retained samples, and incremental vacuum runs only
+after a sweep deletes expired physical data and reaches its cutoff. A sweep with
+nothing to delete exits before metadata maintenance and vacuum. Retention is
+therefore proportional to the expired data, not the retained history.
 
 ## Worker protocol
 

@@ -252,6 +252,49 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		await store.close();
 	});
 
+	it("bounds retention work by physical storage samples", async () => {
+		const { store } = await openStore();
+		const blockSpanMs = 6 * 60 * 60 * 1000;
+		const target = Math.floor(Date.now() / blockSpanMs) * blockSpanMs;
+		const base = target - 180_000;
+		await store.ingest([
+			{ labels: { [NAME]: "m" }, ts: base + 1000, value: 1 },
+			{ labels: { [NAME]: "m" }, ts: base + 61_000, value: 2 },
+			{ labels: { [NAME]: "m" }, ts: base + 121_000, value: 3 },
+		]);
+		const first = await store.deleteBeforeBatch(target, 1);
+		expect(first).toEqual({
+			complete: false,
+			cutoffMs: target,
+			deletedSamples: 1,
+		});
+		// Exact logical metadata is updated once the aligned cutoff completes;
+		// hot rows can overlap cold blocks, so partial physical counts cannot be
+		// subtracted safely.
+		expect((await store.quickStats()).sampleCount).toBe(3);
+
+		const second = await store.deleteBeforeBatch(target, 1);
+		expect(second.complete).toBe(false);
+		expect(second.cutoffMs).toBe(target);
+		expect((await store.quickStats()).sampleCount).toBe(3);
+
+		const third = await store.deleteBeforeBatch(target, 1);
+		expect(third.complete).toBe(true);
+		expect(third.cutoffMs).toBe(target);
+		expect(third.deletedSamples).toBe(1);
+		expect(await store.quickStats()).toMatchObject({
+			sampleCount: 0,
+			oldestSampleMs: null,
+			newestSampleMs: null,
+		});
+		expect(await store.deleteBeforeBatch(target, 1)).toEqual({
+			complete: true,
+			cutoffMs: target,
+			deletedSamples: 0,
+		});
+		await store.close();
+	});
+
 	it("serializes concurrent operations (Asyncify forbids reentrancy)", async () => {
 		const { store } = await openStore();
 		const batch = (name: string, base: number) =>
@@ -599,14 +642,19 @@ describe("storage backend selection", () => {
 
 	it("skips OPFS worker planning when the worker probe fails", async () => {
 		const adapter = makeAdapter();
+		let probeFailure: string | null = null;
 
 		const plan = await prepareWorkerOpfsOpenPlan({
 			adapter,
 			pluginDir: "plugin",
 			probe: async () => ({ ok: false, error: "no sync handles" }),
+			onProbeFailure: (error) => {
+				probeFailure = error;
+			},
 		});
 
 		expect(plan).toBeNull();
+		expect(probeFailure).toBe("no sync handles");
 	});
 
 	it("plans OPFS worker storage without raw-seeding desktop sqlite", async () => {

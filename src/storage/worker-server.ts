@@ -1,4 +1,6 @@
 import type { MetricsStoreLike } from "./store";
+import { PromQLError } from "../promql/ast";
+import { PromQLEngine } from "../promql/engine";
 import type {
 	WorkerStoreRequest,
 	WorkerStoreResponse,
@@ -20,6 +22,7 @@ export type WorkerStoreOpenHandler = (
 
 export class WorkerStoreServer {
 	private store: MetricsStoreLike | null = null;
+	private queryEngine: PromQLEngine | null = null;
 	private queue: Promise<unknown> = Promise.resolve();
 	private unsubscribe: (() => void) | null;
 	private closed = false;
@@ -40,6 +43,7 @@ export class WorkerStoreServer {
 		this.unsubscribe = null;
 		const store = this.store;
 		this.store = null;
+		this.queryEngine = null;
 		void store?.close().catch((error) => {
 			console.warn("tsdb: worker store server close failed", error);
 		});
@@ -64,12 +68,19 @@ export class WorkerStoreServer {
 		);
 		void run.then(
 			(value) => this.transport.post({ id: request.id, ok: true, value }),
-			(error) =>
-				this.transport.post({
-					id: request.id,
-					ok: false,
-					error: error instanceof Error ? error.message : String(error),
-				})
+			(error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				this.transport.post(
+					error instanceof PromQLError
+						? {
+								id: request.id,
+								ok: false,
+								error: message,
+								errorType: error.errorType,
+						  }
+						: { id: request.id, ok: false, error: message }
+				);
+			}
 		);
 	}
 
@@ -78,6 +89,7 @@ export class WorkerStoreServer {
 			case "open": {
 				if (this.store) await this.store.close();
 				this.store = await this.openStore(request);
+				this.queryEngine = new PromQLEngine(this.store);
 				return {
 					recoveredFromCorruption: this.store.recoveredFromCorruption,
 				};
@@ -85,6 +97,7 @@ export class WorkerStoreServer {
 			case "close": {
 				const store = this.store;
 				this.store = null;
+				this.queryEngine = null;
 				await store?.close();
 				return undefined;
 			}
@@ -113,10 +126,27 @@ export class WorkerStoreServer {
 				);
 			case "deleteBefore":
 				return this.requireStore().deleteBefore(request.cutoffMs);
+			case "deleteBeforeBatch":
+				return this.requireStore().deleteBeforeBatch(
+					request.cutoffMs,
+					request.maxSamples
+				);
 			case "quickStats":
 				return this.requireStore().quickStats();
 			case "stats":
 				return this.requireStore().stats();
+			case "instantQuery":
+				return this.requireQueryEngine().instantQuery(
+					request.query,
+					request.timeMs
+				);
+			case "rangeQuery":
+				return this.requireQueryEngine().rangeQuery(
+					request.query,
+					request.startMs,
+					request.endMs,
+					request.stepMs
+				);
 		}
 	}
 
@@ -125,5 +155,12 @@ export class WorkerStoreServer {
 			throw new Error("tsdb: worker store is not open");
 		}
 		return this.store;
+	}
+
+	private requireQueryEngine(): PromQLEngine {
+		if (!this.queryEngine) {
+			throw new Error("tsdb: worker query engine is not open");
+		}
+		return this.queryEngine;
 	}
 }

@@ -3,6 +3,7 @@ import type { Labels, Matcher } from "../src/labels";
 import type {
 	MetricsStoreLike,
 	QuickStoreStats,
+	RetentionDeleteResult,
 	SeriesData,
 	StoredSample,
 	StoreStats,
@@ -89,6 +90,12 @@ class FakeStore implements MetricsStoreLike {
 	}
 
 	async deleteBefore(_cutoffMs: number): Promise<void> {}
+	async deleteBeforeBatch(
+		cutoffMs: number,
+		_maxSamples: number
+	): Promise<RetentionDeleteResult> {
+		return { complete: true, cutoffMs, deletedSamples: 0 };
+	}
 
 	async quickStats(): Promise<QuickStoreStats> {
 		return { ...this.statsResult, sampleCount: 0, samplesLastHour: 0 };
@@ -158,6 +165,53 @@ describe("WorkerStoreServer", () => {
 			id: 3,
 			ok: true,
 			value: store.selectResult,
+		});
+
+		transport.send({
+			id: 4,
+			op: "instantQuery",
+			query: "metric",
+			timeMs: 1000,
+		});
+		await flush();
+		expect(transport.responses[3]).toEqual({
+			id: 4,
+			ok: true,
+			value: {
+				resultType: "vector",
+				result: [
+					{
+						metric: { __name__: "metric" },
+						value: [1, "2"],
+					},
+				],
+			},
+		});
+
+		transport.send({
+			id: 5,
+			op: "rangeQuery",
+			query: "metric",
+			startMs: 1000,
+			endMs: 2000,
+			stepMs: 1000,
+		});
+		await flush();
+		expect(transport.responses[4]).toEqual({
+			id: 5,
+			ok: true,
+			value: {
+				resultType: "matrix",
+				result: [
+					{
+						metric: { __name__: "metric" },
+						values: [
+							[1, "2"],
+							[2, "2"],
+						],
+					},
+				],
+			},
 		});
 	});
 
@@ -229,6 +283,27 @@ describe("WorkerStoreServer", () => {
 			id: 3,
 			ok: true,
 			value: ["__name__"],
+		});
+	});
+
+	it("preserves PromQL error types in worker responses", async () => {
+		const transport = new FakeTransport();
+		new WorkerStoreServer(transport, async () => new FakeStore());
+
+		transport.send({
+			id: 1,
+			op: "open",
+			dbName: "metrics",
+			wasmBinary: new Uint8Array([1]),
+		});
+		await flush();
+		transport.send({ id: 2, op: "instantQuery", query: "sum(", timeMs: 1000 });
+		await flush();
+
+		expect(transport.responses[1]).toMatchObject({
+			id: 2,
+			ok: false,
+			errorType: "bad_data",
 		});
 	});
 

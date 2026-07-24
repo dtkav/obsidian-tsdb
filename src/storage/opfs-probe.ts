@@ -20,6 +20,8 @@ export type OpfsWorkerProbeMessage =
 	| { id: number; ok: true }
 	| { id: number; ok: false; error: string };
 
+export const OPFS_WORKER_PROBE_TIMEOUT_MS = 5000;
+
 export const OPFS_WORKER_PROBE_SOURCE = `
 self.onmessage = async (event) => {
   const id = event.data && typeof event.data.id === "number" ? event.data.id : 0;
@@ -62,7 +64,7 @@ export async function probeOpfsWorker(options: {
 	createWorker?: (source: string) => OpfsProbeWorkerLike;
 } = {}): Promise<OpfsWorkerProbeResult> {
 	const createWorker = options.createWorker ?? createProbeWorker;
-	const timeoutMs = options.timeoutMs ?? 1000;
+	const timeoutMs = options.timeoutMs ?? OPFS_WORKER_PROBE_TIMEOUT_MS;
 	let worker: OpfsProbeWorkerLike;
 	try {
 		worker = createWorker(OPFS_WORKER_PROBE_SOURCE);

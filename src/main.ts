@@ -1,7 +1,8 @@
 import { MarkdownView, Notice, Plugin, TFile, parseYaml } from "obsidian";
-// esbuild "binary" loader: the SQLite WASM binary is embedded in main.js.
-import waSqliteAsyncWasm from "wa-sqlite/dist/wa-sqlite-async.wasm";
-import waSqliteSyncWasm from "wa-sqlite/dist/wa-sqlite.wasm";
+// esbuild "base64" loader: keep the embedded SQLite WASM encoded until the
+// workspace is ready instead of decoding it while Obsidian evaluates main.js.
+import waSqliteAsyncWasmBase64 from "wa-sqlite/dist/wa-sqlite-async.wasm";
+import waSqliteSyncWasmBase64 from "wa-sqlite/dist/wa-sqlite.wasm";
 import tsdbWorkerSource from "tsdb-worker-source";
 import { installMetricsGlobal } from "./api/debug-global";
 import { ApiHealthStatus, ApiServer } from "./api/server";
@@ -17,14 +18,10 @@ import {
 } from "./exporter/sources";
 import { setupTsdbMetrics } from "./exporter/tsdb-metrics";
 import type { TsdbMetricsRecorder } from "./exporter/tsdb-metrics";
-import { PromQLEngine } from "./promql/engine";
+import { PromQLEngine, PromQLQueryEngine } from "./promql/engine";
 import { Scraper, ScraperStatus } from "./scrape/scraper";
 import { summarizeScraperHealth, WalHealthStatus } from "./health";
-import {
-	DEFAULT_SETTINGS,
-	ObsidianMetricsSettings,
-	mergeSettings,
-} from "./settings";
+import { ObsidianMetricsSettings, mergeSettings } from "./settings";
 import { IObsidianMetricsRootAPI } from "./types";
 import type { ErrnoError } from "./types/runtime";
 import { PromQLPanel } from "./panels/panel";
@@ -70,6 +67,11 @@ declare global {
 
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
+const STARTUP_RETENTION_DELAY_MS = 60 * 1000;
+const RETENTION_BATCH_MAX_SAMPLES = 100_000;
+const RETENTION_BATCH_PAUSE_MS = 100;
+const WORKER_OPFS_START_ATTEMPTS = 2;
+const WORKER_OPFS_RETRY_DELAY_MS = 5000;
 const PROMQL_BLOCK_RE = /```[ \t]*promql[^\r\n]*(?:\r?\n)([\s\S]*?)(?:\r?\n)```/gi;
 const STALE_PROMQL_PANEL_TEXT = "promql panel: metrics store is not running";
 const STORAGE_MIGRATION_INITIAL_BATCH_SIZE = 20_000;
@@ -99,9 +101,12 @@ export interface StorageMigrationStatus {
 }
 
 export default class ObsidianMetricsPlugin extends Plugin {
-	settings: ObsidianMetricsSettings = DEFAULT_SETTINGS;
+	settings: ObsidianMetricsSettings = mergeSettings(undefined);
 
 	private sources: MetricSourceRegistry | null = null;
+	private runtimeInitializationPromise: Promise<void> | null = null;
+	private asyncWasmBinary: Uint8Array | null = null;
+	private syncWasmBinary: Uint8Array | null = null;
 	private store: MetricsStoreLike | null = null;
 	private storageBackend: ApiHealthStatus["store"]["backend"] = "unknown";
 	private wal: SampleWal | null = null;
@@ -111,11 +116,13 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private tsdbMetrics: TsdbMetricsRecorder | null = null;
 	private settingsTab: MetricsSettingTab | null = null;
 	/** Query engine over the local TSDB (used by the API and note panels). */
-	public engine: PromQLEngine | null = null;
+	public engine: PromQLQueryEngine | null = null;
 	private apiServer: ApiServer | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private flushTimer: number | null = null;
 	private retentionTimer: number | null = null;
+	private startupRetentionTimer: number | null = null;
+	private retentionSweepPromise: Promise<void> | null = null;
 	private markdownRefreshScheduled = false;
 	private inFlightIngests = new Set<Promise<void>>();
 	private storeHealth: IngestHealth = {
@@ -149,119 +156,18 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	 * returns a metric-creation API recorded under job=<name>.
 	 * Access via app.plugins.plugins['tsdb'].api
 	 */
-	public api: IObsidianMetricsRootAPI;
+	public api: IObsidianMetricsRootAPI | undefined;
 
-	async onload() {
+	onload(): void {
 		this.isUnloading = false;
-		await this.waitForPreviousTeardown();
-		await this.loadSettings();
-
-		// Exporter side: metric stores (named registries, each recorded at
-		// its own frequency). There is no default store — consumers claim a
-		// named one via api.getStore(name, { intervalSeconds }).
-		const sources = new MetricSourceRegistry(
-			this.settings.customMetricsPrefix,
-			() => this.restartScraper()
-		);
-		this.sources = sources;
-		sources.setDefaultLabels({
-			vault_name: this.app.vault.getName(),
-			vault_id: this.app.appId ?? "",
+		this.registerUi();
+		this.app.workspace.onLayoutReady(() => {
+			if (!this.isUnloading) this.startRuntimeInitialization();
 		});
-		const apiState: { sources: MetricSourceRegistry | null } = {
-			sources,
-		};
-		this.register(() => {
-			apiState.sources = null;
-		});
-		this.api = {
-			getStore: (name, options) => {
-				if (!apiState.sources) {
-					throw new Error("tsdb: plugin is not loaded");
-				}
-				return apiState.sources.getSource(name, options).api;
-			},
-		};
-		// Register the built-in store up front so it appears in settings with
-		// its docstring even before its collectors produce data.
-		sources.getSource(VAULT_SOURCE, {
-			displayName: "Vault metrics",
-			description:
-				"File activity, note view time, vault size, note counts, open notes, and enabled plugins.",
-		});
-		sources.getSource(PERFORMANCE_SOURCE, {
-			displayName: "Performance metrics",
-			description:
-				"Browser memory usage and measured Obsidian API timings.",
-		});
-		this.tsdbMetrics = setupTsdbMetrics(
-			sources.getSource(TSDB_SOURCE, {
-				displayName: "TSDB internals",
-				description:
-					"Scrape collection, SQLite ingest, WAL checkpoint, and queue health.",
-			}).api
-		);
-		this.register(() => {
-			this.tsdbMetrics = null;
-		});
+	}
 
-		// TSDB side: SQLite (wa-sqlite over a desktop .sqlite file when
-		// available, else the vault-adapter chunk VFS), WAL, scraper and query
-		// API. Every committed ingest is durable.
-		const pluginDir = this.pluginDirectory();
-		this.store = await this.openMetricsStore(pluginDir);
-
-		// The WAL remains as a recovery net. Entries are written only after
-		// their SQLite transaction commits, so a healthy database can checkpoint
-		// the log immediately; replay is only needed after store recovery.
-		this.wal = new SampleWal(
-			this.app.vault.adapter,
-			`${this.manifest.dir}/${WAL_FILENAME}`
-		);
-		this.startWalStartupMaintenance();
-
-		this.scraper = new Scraper(
-			{
-				ingest: (samples: StoredSample[]) => this.ingestDurably(samples),
-			},
-			() => this.settingsTab?.onScrapeStatusChanged(),
-			(observation) => {
-				this.tsdbMetrics?.recordScrape({
-					source: observation.source,
-					kind: observation.kind,
-					status: observation.status,
-					durationSeconds: observation.durationSeconds,
-					samplesScraped: observation.samplesScraped,
-				});
-			}
-		);
-
-		this.engine = new PromQLEngine(this.store);
-		this.apiServer = new ApiServer({
-			getExposition: () => this.getExposition(),
-			engine: this.engine,
-			store: this.store,
-			getHealth: () => this.getHealthStatus(),
-			getMetricsPath: () => this.settings.serverConfig.path,
-			pluginVersion: this.manifest.version,
-		});
-
-		if (this.settings.serverConfig.enabled) {
-			await this.startMetricsServer();
-		}
-
-		setupVaultMetrics(this, sources.getSource(VAULT_SOURCE).api);
-		setupPerformanceMetrics(
-			this,
-			sources.getSource(PERFORMANCE_SOURCE).api
-		);
-
-		this.updateTsdbHealthMetrics();
-		this.restartScraper();
-		this.restartMaintenanceTimers();
-		this.pruneOldSamples();
-
-		// UI: ribbon, status bar, commands, settings.
+	/** Register only lightweight surfaces while Obsidian is loading plugins. */
+	private registerUi(): void {
 		this.removeStaleStatusBarItems();
 		this.addRibbonIcon("bar-chart-2", "TSDB", () => {
 			new MetricsModal(this.app, this).open();
@@ -300,7 +206,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.register(() => {
 			this.settingsTab = null;
 		});
-		new TimeSelectorController(this, this.timeContext);
 
 		this.registerView(
 			METRICS_DASHBOARD_VIEW_TYPE,
@@ -313,9 +218,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				new PromQLPanel(el, this, source, ctx.sourcePath, ctx.frontmatter)
 			);
 		});
-		this.refreshMarkdownPreviews();
-		this.app.workspace.onLayoutReady(() => this.scheduleMarkdownPanelRefresh());
-		this.scheduleMarkdownPanelRefresh();
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
 				void this.repairStalePromqlPanels();
@@ -336,12 +238,155 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			name: "Open metrics dashboard",
 			callback: () => void openMetricsDashboard(this),
 		});
+	}
 
-		// Emit ready event so other plugins can initialize their metrics.
-		this.app.workspace.trigger("tsdb:ready", this.api);
-		this.app.workspace.onLayoutReady(() => {
-			this.app.workspace.trigger("tsdb:ready", this.api);
+	private startRuntimeInitialization(): void {
+		if (this.isUnloading || this.runtimeInitializationPromise) return;
+		const initialization = this.initializeRuntime();
+		this.runtimeInitializationPromise = initialization;
+		void initialization
+			.catch((error) => {
+				if (this.isUnloading) return;
+				console.error("tsdb: runtime initialization failed", error);
+				new Notice(
+					`TSDB could not finish starting. ${this.errorMessage(error)}`,
+					10000
+				);
+			})
+			.finally(() => {
+				if (this.runtimeInitializationPromise === initialization) {
+					this.runtimeInitializationPromise = null;
+				}
+			});
+	}
+
+	/** Heavy startup begins only after Workspace.onLayoutReady has fired. */
+	private async initializeRuntime(): Promise<void> {
+		await this.waitForPreviousTeardown();
+		if (this.isUnloading) return;
+
+		await this.loadSettings();
+		if (this.isUnloading) return;
+
+		// Exporter side: metric stores (named registries, each recorded at
+		// its own frequency). There is no default store — consumers claim a
+		// named one via api.getStore(name, { intervalSeconds }).
+		const sources = new MetricSourceRegistry(
+			this.settings.customMetricsPrefix,
+			() => this.restartScraper()
+		);
+		this.sources = sources;
+		sources.setDefaultLabels({
+			vault_name: this.app.vault.getName(),
+			vault_id: this.app.appId ?? "",
 		});
+		const apiState: { sources: MetricSourceRegistry | null } = {
+			sources,
+		};
+		this.register(() => {
+			apiState.sources = null;
+		});
+		const api: IObsidianMetricsRootAPI = {
+			getStore: (name, options) => {
+				if (!apiState.sources) {
+					throw new Error("tsdb: plugin is not loaded");
+				}
+				return apiState.sources.getSource(name, options).api;
+			},
+		};
+		// Register the built-in store up front so it appears in settings with
+		// its docstring even before its collectors produce data.
+		sources.getSource(VAULT_SOURCE, {
+			displayName: "Vault metrics",
+			description:
+				"File activity, note view time, vault size, note counts, open notes, and enabled plugins.",
+		});
+		sources.getSource(PERFORMANCE_SOURCE, {
+			displayName: "Performance metrics",
+			description:
+				"Browser memory usage and measured Obsidian API timings.",
+		});
+		this.tsdbMetrics = setupTsdbMetrics(
+			sources.getSource(TSDB_SOURCE, {
+				displayName: "TSDB internals",
+				description:
+					"Scrape collection, SQLite ingest, WAL checkpoint, and queue health.",
+			}).api
+		);
+		this.register(() => {
+			this.tsdbMetrics = null;
+		});
+
+		// TSDB side: SQLite/WASM, WAL, scraper and query API. This is the
+		// expensive part of startup and must never be awaited by onload().
+		const store = await this.openMetricsStore(this.pluginDirectory());
+		if (this.isUnloading) {
+			await store.close().catch((error) => {
+				console.warn("tsdb: deferred store close failed", error);
+			});
+			return;
+		}
+		this.store = store;
+
+		// The WAL remains as a recovery net. Entries are written only after
+		// their SQLite transaction commits, so a healthy database can checkpoint
+		// the log immediately; replay is only needed after store recovery.
+		this.wal = new SampleWal(
+			this.app.vault.adapter,
+			`${this.manifest.dir}/${WAL_FILENAME}`
+		);
+		this.startWalStartupMaintenance();
+
+		this.scraper = new Scraper(
+			{
+				ingest: (samples: StoredSample[]) => this.ingestDurably(samples),
+			},
+			() => this.settingsTab?.onScrapeStatusChanged(),
+			(observation) => {
+				this.tsdbMetrics?.recordScrape({
+					source: observation.source,
+					kind: observation.kind,
+					status: observation.status,
+					durationSeconds: observation.durationSeconds,
+					samplesScraped: observation.samplesScraped,
+				});
+			}
+		);
+
+		// OPFS queries execute beside SQLite in the worker so only the final
+		// PromQL result crosses into the renderer. Fallback stores retain the
+		// in-process engine because their VFS APIs already run on this thread.
+		this.engine =
+			store instanceof WorkerMetricsStore ? store : new PromQLEngine(store);
+		this.apiServer = new ApiServer({
+			getExposition: () => this.getExposition(),
+			engine: this.engine,
+			store,
+			getHealth: () => this.getHealthStatus(),
+			getMetricsPath: () => this.settings.serverConfig.path,
+			pluginVersion: this.manifest.version,
+		});
+
+		if (this.settings.serverConfig.enabled) {
+			await this.startMetricsServer();
+			if (this.isUnloading) return;
+		}
+
+		setupVaultMetrics(this, sources.getSource(VAULT_SOURCE).api);
+		setupPerformanceMetrics(
+			this,
+			sources.getSource(PERFORMANCE_SOURCE).api
+		);
+		new TimeSelectorController(this, this.timeContext);
+
+		this.updateTsdbHealthMetrics();
+		this.restartScraper();
+		this.restartMaintenanceTimers();
+		this.scheduleMarkdownPanelRefresh();
+
+		// Publish the API only once the database and scraper are ready.
+		this.api = api;
+		this.app.workspace.trigger("tsdb:ready", api);
 	}
 
 	onunload() {
@@ -369,6 +414,16 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			if (window.__tsdbTeardownPromise === previous) {
 				delete window.__tsdbTeardownPromise;
 			}
+		}
+	}
+
+	private async waitForRuntimeInitialization(): Promise<void> {
+		const initialization = this.runtimeInitializationPromise;
+		if (!initialization) return;
+		try {
+			await initialization;
+		} catch (error) {
+			console.warn("tsdb: runtime initialization failed during teardown", error);
 		}
 	}
 
@@ -456,6 +511,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	}
 
 	private async teardown(): Promise<void> {
+		await this.waitForRuntimeInitialization();
 		this.closePluginViews();
 		this.scraper?.dispose();
 		this.clearMaintenanceTimers();
@@ -464,11 +520,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.apiServer?.dispose();
 		this.walReplayCancelled = true;
 		await this.waitForWalStartupMaintenance();
-		await this.waitForInFlightIngests();
-		await this.flushStore();
 		await this.store?.close().catch((error) => {
 			console.error("tsdb: error closing store", error);
 		});
+		// Store close drains its operation queue (or rejects it on a forced
+		// worker shutdown), so every tracked ingest is settled before the WAL
+		// checkpoint decides whether it is safe to truncate.
+		await this.waitForInFlightIngests();
+		await this.flushStore();
 		this.sources?.dispose();
 		this.sources = null;
 		this.scraper = null;
@@ -479,11 +538,9 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.store = null;
 		this.storageBackend = "unknown";
 		this.engine = null;
-		this.api = {
-			getStore: () => {
-				throw new Error("tsdb: plugin is not loaded");
-			},
-		};
+		this.api = undefined;
+		this.asyncWasmBinary = null;
+		this.syncWasmBinary = null;
 	}
 
 	// -- server ------------------------------------------------------------
@@ -650,7 +707,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			sourceStore = await MetricsStore.open({
 				location: source.location,
 				dbName: source.dbName,
-				wasmBinary: waSqliteAsyncWasm,
+				wasmBinary: this.getAsyncWasmBinary(),
 				recoverCorruption: false,
 			});
 			const stats = await sourceStore.quickStats();
@@ -731,6 +788,20 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		);
 	}
 
+	private getAsyncWasmBinary(): Uint8Array {
+		if (!this.asyncWasmBinary) {
+			this.asyncWasmBinary = decodeBase64Bytes(waSqliteAsyncWasmBase64);
+		}
+		return this.asyncWasmBinary;
+	}
+
+	private getSyncWasmBinary(): Uint8Array {
+		if (!this.syncWasmBinary) {
+			this.syncWasmBinary = decodeBase64Bytes(waSqliteSyncWasmBase64);
+		}
+		return this.syncWasmBinary;
+	}
+
 	private startStorageMigrationTotalCount(
 		source: LegacyStorageMigrationSource,
 		startedMs: number
@@ -741,7 +812,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 				countStore = await MetricsStore.open({
 					location: source.location,
 					dbName: source.dbName,
-					wasmBinary: waSqliteAsyncWasm,
+					wasmBinary: this.getAsyncWasmBinary(),
 					recoverCorruption: false,
 				});
 				const totalSamples = await countStore.countSamples();
@@ -766,31 +837,47 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private async openMetricsStore(pluginDir: string): Promise<MetricsStoreLike> {
 		let opfsFailure: unknown = null;
 		if (this.settings.storage.workerBackend) {
-			const workerPlan = await prepareWorkerOpfsOpenPlan({
-				adapter: this.app.vault.adapter,
-				pluginDir,
-				namespace: this.storageNamespace(),
-			});
-			if (workerPlan) {
-				try {
-					const store = await WorkerMetricsStore.open(
-						createInlineWorkerStoreTransport(tsdbWorkerSource),
-						{
-							dbName: workerPlan.dbName,
-							wasmBinary: waSqliteSyncWasm,
-						}
+			for (let attempt = 1; attempt <= WORKER_OPFS_START_ATTEMPTS; attempt++) {
+				let probeFailure: string | null = null;
+				const workerPlan = await prepareWorkerOpfsOpenPlan({
+					adapter: this.app.vault.adapter,
+					pluginDir,
+					namespace: this.storageNamespace(),
+					onProbeFailure: (error) => {
+						probeFailure = error;
+					},
+				});
+				if (workerPlan) {
+					try {
+						const store = await WorkerMetricsStore.open(
+							createInlineWorkerStoreTransport(tsdbWorkerSource),
+							{
+								dbName: workerPlan.dbName,
+								wasmBinary: this.getSyncWasmBinary(),
+							}
+						);
+						console.log("tsdb: using worker OPFS backend");
+						this.storageBackend = "worker-opfs";
+						return store;
+					} catch (error) {
+						opfsFailure = error;
+						console.warn("tsdb: worker OPFS backend failed", error);
+					}
+				} else {
+					opfsFailure = new Error(
+						`Worker OPFS probe failed: ${probeFailure ?? "unknown error"}`
 					);
-					console.log("tsdb: using worker OPFS backend");
-					this.storageBackend = "worker-opfs";
-					return store;
-				} catch (error) {
-					opfsFailure = error;
-					console.warn("tsdb: worker OPFS backend failed", error);
 				}
-			} else {
-				opfsFailure = new Error(
-					"Worker OPFS storage is unavailable in this runtime."
-				);
+
+				if (attempt < WORKER_OPFS_START_ATTEMPTS && !this.isUnloading) {
+					console.warn(
+						`tsdb: worker OPFS startup attempt ${attempt} failed; retrying`,
+						opfsFailure
+					);
+					await new Promise<void>((resolve) =>
+						window.setTimeout(resolve, WORKER_OPFS_RETRY_DELAY_MS)
+					);
+				}
 			}
 		} else {
 			opfsFailure = new Error("Worker OPFS storage is disabled in settings.");
@@ -809,12 +896,12 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		const storePlan = await prepareStoreOpenPlan({
 			adapter: this.app.vault.adapter,
 			pluginDir,
-			wasmBinary: waSqliteAsyncWasm,
+			wasmBinary: this.getAsyncWasmBinary(),
 		});
 		const store = await MetricsStore.open({
 			location: storePlan.location,
 			dbName: storePlan.dbName,
-			wasmBinary: waSqliteAsyncWasm,
+			wasmBinary: this.getAsyncWasmBinary(),
 		});
 		this.storageBackend = storePlan.backend;
 		return store;
@@ -832,6 +919,10 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			() => void this.flushStore(),
 			Math.max(10, this.settings.storage.flushIntervalSeconds) * 1000
 		);
+		this.startupRetentionTimer = window.setTimeout(() => {
+			this.startupRetentionTimer = null;
+			this.pruneOldSamples();
+		}, STARTUP_RETENTION_DELAY_MS);
 		this.retentionTimer = window.setInterval(
 			() => this.pruneOldSamples(),
 			RETENTION_SWEEP_MS
@@ -841,17 +932,48 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private clearMaintenanceTimers(): void {
 		if (this.flushTimer !== null) window.clearInterval(this.flushTimer);
 		if (this.retentionTimer !== null) window.clearInterval(this.retentionTimer);
+		if (this.startupRetentionTimer !== null) {
+			window.clearTimeout(this.startupRetentionTimer);
+		}
 		this.flushTimer = null;
 		this.retentionTimer = null;
+		this.startupRetentionTimer = null;
 	}
 
 	private pruneOldSamples(): void {
-		if (!this.store) return;
+		if (!this.store || this.retentionSweepPromise) return;
+		const store = this.store;
 		const cutoff =
 			Date.now() - this.settings.storage.retentionDays * 24 * 3600 * 1000;
-		this.store.deleteBefore(cutoff).catch((error) => {
-			console.error("tsdb: retention pruning failed", error);
-		});
+		const sweep = this.runRetentionSweep(store, cutoff);
+		this.retentionSweepPromise = sweep;
+		void sweep
+			.catch((error) => {
+				if (!this.isUnloading) {
+					console.error("tsdb: retention pruning failed", error);
+				}
+			})
+			.finally(() => {
+				if (this.retentionSweepPromise === sweep) {
+					this.retentionSweepPromise = null;
+				}
+			});
+	}
+
+	private async runRetentionSweep(
+		store: MetricsStoreLike,
+		cutoffMs: number
+	): Promise<void> {
+		while (!this.isUnloading && this.store === store) {
+			const result = await store.deleteBeforeBatch(
+				cutoffMs,
+				RETENTION_BATCH_MAX_SAMPLES
+			);
+			if (result.complete) return;
+			await new Promise<void>((resolve) =>
+				window.setTimeout(resolve, RETENTION_BATCH_PAUSE_MS)
+			);
+		}
 	}
 
 	// -- persistence ---------------------------------------------------------
@@ -906,22 +1028,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	}
 
 	private async waitForInFlightIngests(): Promise<void> {
-		const deadline = Date.now() + 2000;
-		while (this.inFlightIngests.size > 0 && Date.now() < deadline) {
-			const remaining = Math.max(0, deadline - Date.now());
-			await Promise.race([
-				Promise.allSettled(Array.from(this.inFlightIngests)),
-				new Promise<void>((resolve) =>
-					window.setTimeout(resolve, Math.min(250, remaining))
-				),
-			]);
-		}
-		if (this.inFlightIngests.size > 0) {
-			console.warn(
-				"tsdb: abandoning in-flight ingests during teardown",
-				this.inFlightIngests.size
-			);
-			this.inFlightIngests.clear();
+		while (this.inFlightIngests.size > 0) {
+			await Promise.allSettled(Array.from(this.inFlightIngests));
 		}
 	}
 
@@ -1185,4 +1293,13 @@ function extractPromqlBlocks(markdown: string): string[] {
 		blocks.push(match[1]);
 	}
 	return blocks;
+}
+
+function decodeBase64Bytes(encoded: string): Uint8Array {
+	const binary = window.atob(encoded);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index++) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+	return bytes;
 }

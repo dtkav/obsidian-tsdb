@@ -192,8 +192,9 @@ export default class MyPlugin extends Plugin {
 }
 ```
 
-Registration is idempotent. If TSDB reloads, `tsdb:ready` fires again and your
-plugin should recreate its store and metric references.
+Registration is idempotent. `tsdb:ready` fires after Obsidian's workspace layout
+and the local database are ready. If TSDB reloads, it fires again and your plugin
+should recreate its store and metric references.
 
 ### Metric types
 
@@ -286,6 +287,8 @@ window.__tsdb?.getInfo();
 
 The same helper exposes `getStats()`, `getScrapeStatuses()`, `query(expr)`, and
 `queryRange(expr, startMs, endMs, stepMs)` for local tooling and tests.
+With the worker-OPFS backend, PromQL evaluation runs in the storage worker so
+only the final query result is transferred to Obsidian's renderer.
 
 ### Scrape Prometheus endpoints
 

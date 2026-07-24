@@ -1101,7 +1101,18 @@ export type ApiResultData =
 			result: Array<{ metric: Labels; values: Array<[number, string]> }>;
 	  };
 
-export class PromQLEngine {
+/** Query surface shared by the in-process engine and the OPFS worker proxy. */
+export interface PromQLQueryEngine {
+	instantQuery(query: string, timeMs: number): Promise<ApiResultData>;
+	rangeQuery(
+		query: string,
+		startMs: number,
+		endMs: number,
+		stepMs: number
+	): Promise<ApiResultData>;
+}
+
+export class PromQLEngine implements PromQLQueryEngine {
 	private lookbackMs: number;
 	private maxSteps: number;
 
