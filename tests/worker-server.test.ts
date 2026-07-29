@@ -45,6 +45,8 @@ class FakeStore implements MetricsStoreLike {
 	closed = false;
 	ingested: StoredSample[] = [];
 	selectResult: SeriesData[] = [];
+	finalized: Array<{ cutoffMs: number; phase: "metadata" | "series" }> = [];
+	vacuumLimits: number[] = [];
 	statsResult: StoreStats = {
 		seriesCount: 0,
 		sampleCount: 0,
@@ -96,6 +98,33 @@ class FakeStore implements MetricsStoreLike {
 	): Promise<RetentionDeleteResult> {
 		return { complete: true, cutoffMs, deletedSamples: 0 };
 	}
+	async compactBeforeBatch(
+		cutoffMs: number,
+		_maxPoints: number
+	) {
+		return {
+			complete: true,
+			cutoffMs,
+			compactedPoints: 0,
+			oldestUncompactedMs: null,
+		};
+	}
+	async finalizeRetention(
+		cutoffMs: number,
+		phase: "metadata" | "series"
+	): Promise<void> {
+		this.finalized.push({ cutoffMs, phase });
+	}
+	async vacuumBatch(maxPages: number) {
+		this.vacuumLimits.push(maxPages);
+		return {
+			complete: true,
+			reclaimedPages: 0,
+			remainingPages: 0,
+			pageCount: 1,
+			pageSize: 4096,
+		};
+	}
 
 	async quickStats(): Promise<QuickStoreStats> {
 		return { ...this.statsResult, sampleCount: 0, samplesLastHour: 0 };
@@ -137,17 +166,25 @@ describe("WorkerStoreServer", () => {
 		});
 		await flush();
 		expect(opened).toHaveLength(1);
-		expect(transport.responses[0]).toEqual({
+		expect(transport.responses[0]).toMatchObject({
 			id: 1,
 			ok: true,
 			value: { recoveredFromCorruption: true },
+			timing: {
+				op: "open",
+				requestClass: "foreground",
+				queueWaitMs: expect.any(Number),
+				durationMs: expect.any(Number),
+				foregroundQueueDepth: 0,
+				maintenanceQueueDepth: 0,
+			},
 		});
 
 		const sample = { labels: { __name__: "metric" }, ts: 1000, value: 2 };
 		transport.send({ id: 2, op: "ingest", samples: [sample] });
 		await flush();
 		expect(store.ingested).toEqual([sample]);
-		expect(transport.responses[1]).toEqual({
+		expect(transport.responses[1]).toMatchObject({
 			id: 2,
 			ok: true,
 			value: undefined,
@@ -161,7 +198,7 @@ describe("WorkerStoreServer", () => {
 			endMs: 10_000,
 		});
 		await flush();
-		expect(transport.responses[2]).toEqual({
+		expect(transport.responses[2]).toMatchObject({
 			id: 3,
 			ok: true,
 			value: store.selectResult,
@@ -174,7 +211,7 @@ describe("WorkerStoreServer", () => {
 			timeMs: 1000,
 		});
 		await flush();
-		expect(transport.responses[3]).toEqual({
+		expect(transport.responses[3]).toMatchObject({
 			id: 4,
 			ok: true,
 			value: {
@@ -197,7 +234,7 @@ describe("WorkerStoreServer", () => {
 			stepMs: 1000,
 		});
 		await flush();
-		expect(transport.responses[4]).toEqual({
+		expect(transport.responses[4]).toMatchObject({
 			id: 5,
 			ok: true,
 			value: {
@@ -212,6 +249,59 @@ describe("WorkerStoreServer", () => {
 					},
 				],
 			},
+		});
+
+		transport.send({
+			id: 6,
+			op: "compactBeforeBatch",
+			cutoffMs: 21_600_000,
+			maxPoints: 50_000,
+		});
+		await flush();
+		expect(transport.responses[5]).toMatchObject({
+			id: 6,
+			ok: true,
+			value: {
+				complete: true,
+				cutoffMs: 21_600_000,
+				compactedPoints: 0,
+				oldestUncompactedMs: null,
+			},
+		});
+
+		transport.send({
+			id: 7,
+			op: "finalizeRetention",
+			cutoffMs: 21_600_000,
+			phase: "metadata",
+		});
+		await flush();
+		expect(store.finalized).toEqual([
+			{ cutoffMs: 21_600_000, phase: "metadata" },
+		]);
+		expect(transport.responses[6]).toMatchObject({
+			id: 7,
+			ok: true,
+			timing: expect.objectContaining({
+				op: "finalizeRetention",
+				requestClass: "maintenance",
+			}),
+		});
+
+		transport.send({ id: 8, op: "vacuumBatch", maxPages: 64 });
+		await flush();
+		expect(store.vacuumLimits).toEqual([64]);
+		expect(transport.responses[7]).toMatchObject({
+			id: 8,
+			ok: true,
+			value: expect.objectContaining({
+				complete: true,
+				reclaimedPages: 0,
+			}),
+			timing: expect.objectContaining({
+				op: "vacuumBatch",
+				requestClass: "maintenance",
+			}),
 		});
 	});
 
@@ -254,6 +344,77 @@ describe("WorkerStoreServer", () => {
 		]);
 	});
 
+	it("runs foreground work before queued maintenance", async () => {
+		const transport = new FakeTransport();
+		const releaseIngest: { current: (() => void) | null } = {
+			current: null,
+		};
+		const calls: string[] = [];
+		const store = new FakeStore();
+		store.ingest = async () => {
+			calls.push("ingest");
+			await new Promise<void>((resolve) => {
+				releaseIngest.current = resolve;
+			});
+		};
+		store.compactBeforeBatch = async (cutoffMs) => {
+			calls.push("compact");
+			return {
+				complete: true,
+				cutoffMs,
+				compactedPoints: 0,
+				oldestUncompactedMs: null,
+			};
+		};
+		store.stats = async () => {
+			calls.push("stats");
+			return store.statsResult;
+		};
+		new WorkerStoreServer(transport, async () => store);
+
+		transport.send({
+			id: 1,
+			op: "open",
+			dbName: "metrics",
+			wasmBinary: new Uint8Array([1]),
+		});
+		await flush();
+		transport.send({ id: 2, op: "ingest", samples: [] });
+		transport.send({
+			id: 3,
+			op: "compactBeforeBatch",
+			cutoffMs: 21_600_000,
+			maxPoints: 512,
+		});
+		transport.send({ id: 4, op: "stats" });
+		await flush();
+
+		expect(calls).toEqual(["ingest"]);
+		if (!releaseIngest.current) throw new Error("ingest did not start");
+		releaseIngest.current();
+		await flush();
+		await flush();
+
+		expect(calls).toEqual(["ingest", "stats", "compact"]);
+		expect(transport.responses.map((response) => response.id)).toEqual([
+			1, 2, 4, 3,
+		]);
+		expect(transport.responses[2]).toMatchObject({
+			timing: expect.objectContaining({
+				op: "stats",
+				requestClass: "foreground",
+				maintenanceQueueDepth: 1,
+			}),
+		});
+		expect(transport.responses[3]).toMatchObject({
+			timing: expect.objectContaining({
+				op: "compactBeforeBatch",
+				requestClass: "maintenance",
+				queueWaitMs: expect.any(Number),
+			}),
+		});
+	});
+
 	it("reports errors without breaking later requests", async () => {
 		const transport = new FakeTransport();
 		const store = new FakeStore();
@@ -274,12 +435,16 @@ describe("WorkerStoreServer", () => {
 		transport.send({ id: 3, op: "labelNames" });
 		await flush();
 
-		expect(transport.responses[1]).toEqual({
+		expect(transport.responses[1]).toMatchObject({
 			id: 2,
 			ok: false,
 			error: "boom",
+			timing: expect.objectContaining({
+				op: "stats",
+				requestClass: "foreground",
+			}),
 		});
-		expect(transport.responses[2]).toEqual({
+		expect(transport.responses[2]).toMatchObject({
 			id: 3,
 			ok: true,
 			value: ["__name__"],
@@ -314,13 +479,16 @@ describe("WorkerStoreServer", () => {
 		transport.send({ id: 1, op: "stats" });
 		await flush();
 
-		expect(transport.responses).toEqual([
-			{
-				id: 1,
-				ok: false,
-				error: "tsdb: worker store is not open",
-			},
-		]);
+		expect(transport.responses).toHaveLength(1);
+		expect(transport.responses[0]).toMatchObject({
+			id: 1,
+			ok: false,
+			error: "tsdb: worker store is not open",
+			timing: expect.objectContaining({
+				op: "stats",
+				requestClass: "foreground",
+			}),
+		});
 	});
 
 	it("closes the current store", async () => {
@@ -339,10 +507,14 @@ describe("WorkerStoreServer", () => {
 		await flush();
 
 		expect(store.closed).toBe(true);
-		expect(transport.responses[1]).toEqual({
+		expect(transport.responses[1]).toMatchObject({
 			id: 2,
 			ok: true,
 			value: undefined,
+			timing: expect.objectContaining({
+				op: "close",
+				requestClass: "foreground",
+			}),
 		});
 
 		server.close();

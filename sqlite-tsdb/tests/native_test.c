@@ -126,7 +126,16 @@ int main(void) {
     execute(
         db,
         "INSERT INTO samples(control,arg1,arg2) "
-        "VALUES('compact-before',2000,100)");
+        "VALUES('compact-before',2000,10)");
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 16);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") == 1);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples") == 20);
+    while (scalar_i64(db, "SELECT count(*) FROM samples_head") > 0) {
+        execute(
+            db,
+            "INSERT INTO samples(control,arg1,arg2) "
+            "VALUES('compact-before',2000,100)");
+    }
     assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 0);
     assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") > 0);
     assert(scalar_i64(db, "SELECT count(*) FROM samples") == 20);

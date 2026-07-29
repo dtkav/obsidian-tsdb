@@ -7,6 +7,7 @@ import {
 	WorkerStoreTransport,
 } from "../src/storage/worker-store";
 import type {
+	WorkerRequestTiming,
 	WorkerStoreRequest,
 	WorkerStoreResponse,
 	WorkerStoreResult,
@@ -44,8 +45,12 @@ class FakeTransport implements WorkerStoreTransport {
 		return this.messages[this.messages.length - 1].transfer;
 	}
 
-	resolve(id: number, value: WorkerStoreResult = undefined): void {
-		this.listener?.({ id, ok: true, value });
+	resolve(
+		id: number,
+		value: WorkerStoreResult = undefined,
+		timing?: WorkerRequestTiming
+	): void {
+		this.listener?.({ id, ok: true, value, timing });
 	}
 
 	reject(id: number, error: string, errorType?: string): void {
@@ -254,6 +259,98 @@ describe("WorkerMetricsStore", () => {
 			complete: false,
 			cutoffMs: 5000,
 			deletedSamples: 100_000,
+		});
+	});
+
+	it("forwards retention finalization and bounded vacuum requests", async () => {
+		const { store, transport } = await openStore();
+		const finalizing = store.finalizeRetention(21_600_000, "series");
+		let message = transport.last();
+		expect(message).toMatchObject({
+			op: "finalizeRetention",
+			cutoffMs: 21_600_000,
+			phase: "series",
+		});
+		transport.resolve(message.id);
+		await finalizing;
+
+		const vacuuming = store.vacuumBatch(64);
+		message = transport.last();
+		expect(message).toMatchObject({ op: "vacuumBatch", maxPages: 64 });
+		transport.resolve(message.id, {
+			complete: false,
+			reclaimedPages: 64,
+			remainingPages: 128,
+			pageCount: 1024,
+			pageSize: 4096,
+		});
+		expect(await vacuuming).toEqual({
+			complete: false,
+			reclaimedPages: 64,
+			remainingPages: 128,
+			pageCount: 1024,
+			pageSize: 4096,
+		});
+	});
+
+	it("observes worker timing without affecting request completion", async () => {
+		const { store, transport } = await openStore();
+		const observations: Array<{
+			timing: WorkerRequestTiming;
+			status: "ok" | "error";
+		}> = [];
+		store.setTimingObserver((timing, status) => {
+			observations.push({ timing, status });
+		});
+
+		const stats = store.quickStats();
+		const message = transport.last();
+		const timing: WorkerRequestTiming = {
+			op: "quickStats",
+			requestClass: "foreground",
+			queueWaitMs: 12,
+			durationMs: 34,
+			foregroundQueueDepth: 1,
+			maintenanceQueueDepth: 2,
+		};
+		transport.resolve(
+			message.id,
+			{
+				seriesCount: 0,
+				sampleCount: 0,
+				oldestSampleMs: null,
+				newestSampleMs: null,
+				sizeBytes: 4096,
+				samplesLastHour: 0,
+			},
+			timing
+		);
+
+		await expect(stats).resolves.toMatchObject({ sampleCount: 0 });
+		expect(observations).toEqual([{ timing, status: "ok" }]);
+	});
+
+	it("forwards bounded compaction requests", async () => {
+		const { store, transport } = await openStore();
+		const compacting = store.compactBeforeBatch(21_600_000, 512);
+		const message = transport.last();
+		expect(message).toMatchObject({
+			op: "compactBeforeBatch",
+			cutoffMs: 21_600_000,
+			maxPoints: 512,
+		});
+		transport.resolve(message.id, {
+			complete: false,
+			cutoffMs: 21_600_000,
+			compactedPoints: 512,
+			oldestUncompactedMs: 10_000,
+		});
+
+		expect(await compacting).toEqual({
+			complete: false,
+			cutoffMs: 21_600_000,
+			compactedPoints: 512,
+			oldestUncompactedMs: 10_000,
 		});
 	});
 

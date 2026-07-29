@@ -135,8 +135,10 @@ TSDB registers a Markdown code block processor for fenced `promql` blocks.
 Each block is parsed as either a bare PromQL expression or a YAML panel
 configuration. The panel resolves its time range, expands time macros, queries
 `PromQLQueryEngine`, and renders the result with uPlot. Auto step selection
-targets roughly 250 output points; raw samples needed for functions such as
-`rate()` remain inside the OPFS worker.
+targets roughly 250 output points. Instant-vector selectors use a step-aware
+SQLite read that omits raw samples which cannot be the latest visible sample
+at any evaluation step. Range-vector selectors still read every sample needed
+by functions such as `rate()`. Both paths remain inside the OPFS worker.
 
 Panels subscribe to the global time context. The global time selector appears
 only when the active note contains a `promql` block. Note frontmatter can
@@ -167,10 +169,16 @@ interface MetricsStoreLike {
   ingest(samples: StoredSample[]): Promise<void>;
   importSamples(samples: StoredSample[]): Promise<void>;
   select(matchers: Matcher[], startMs: number, endMs: number): Promise<SeriesData[]>;
+  selectAtSteps?(matchers: Matcher[], startMs: number, endMs: number,
+    stepMs: number, lookbackMs: number): Promise<SeriesData[]>;
   seriesMatching(matchers: Matcher[], startMs?: number, endMs?: number): Promise<Labels[]>;
   labelNames(matchers?: Matcher[]): Promise<string[]>;
   labelValues(labelName: string, matchers?: Matcher[]): Promise<string[]>;
   deleteBefore(cutoffMs: number): Promise<void>;
+  deleteBeforeBatch(cutoffMs: number, maxSamples: number): Promise<RetentionDeleteResult>;
+  compactBeforeBatch(cutoffMs: number, maxPoints: number): Promise<CompactionBatchResult>;
+  finalizeRetention(cutoffMs: number, phase: "metadata" | "series"): Promise<void>;
+  vacuumBatch(maxPages: number): Promise<VacuumBatchResult>;
   quickStats(): Promise<QuickStoreStats>;
   stats(): Promise<StoreStats>;
   close(): Promise<void>;
@@ -282,7 +290,7 @@ INSERT INTO samples(control, arg1, arg2)
 VALUES ('ingest-batch', :packed_batch, :overwrite_existing);
 
 INSERT INTO samples(control, arg1, arg2)
-VALUES ('compact-before', :cutoff_ms, :bucket_limit);
+VALUES ('compact-before', :cutoff_ms, :point_limit);
 
 INSERT INTO samples(control, arg1)
 VALUES ('delete-before', :cutoff_ms);
@@ -442,19 +450,43 @@ timestamps, and returns an `STB1` blob. The 65,536-point chunks bound aggregate
 memory use. On worker OPFS, those packed chunks are decoded and evaluated in
 the worker; only the final PromQL result crosses to the renderer.
 
+Instant-vector range queries use a related step-aware packed read. A window
+function finds the next sample timestamp and retains a sample only if at least
+one requested evaluation step can observe it under PromQL's strict lookback
+rule. This makes recent chart reads proportional to rendered steps rather than
+the scrape density while preserving offsets and last-sample semantics.
+Range-vector functions keep the raw packed path because intermediate points
+affect their result.
+
 ### Compaction
 
-`compact-before` seals fully closed buckets. For each selected
-`(series_id, bucket_start_ms)` it:
+`compact-before` incrementally seals fully closed buckets:
 
-1. Loads rows for that bucket from hot and cold storage.
-2. Merges and deduplicates them.
-3. Encodes one or more `STB1` payloads.
-4. Replaces cold block rows for that bucket.
-5. Deletes the compacted hot rows.
+1. Finds the oldest compactable hot row through the timestamp index.
+2. Loads at most one bounded hot slice for that series and bucket.
+3. Encodes the slice as an `STB1` block and deletes those hot rows.
+4. For late writes, merges the bounded slice with only the overlapping cold
+   block, replaces that block, and leaves later hot rows for another
+   transaction.
 
-`MetricsStore` runs bounded compaction during ingestion at six-hour boundaries
-rather than during database open or after every scrape.
+The plugin starts compaction only after a five-minute startup grace. Each
+transaction moves one hot slice of at most 512 points into a compressed block.
+If late hot rows overlap a cold block, only that block and the bounded hot
+slice are reconciled. The plugin adjusts the slice limit down toward a
+50-millisecond target. When an idle backlog is four hours old the scheduler
+keeps at least 256 points per slice, rising to 512 points after seven hours, so
+fixed transaction overhead cannot make compaction fall behind ingestion. A
+recent foreground query releases that floor. The pause between transactions
+adapts from 250 milliseconds for an old idle backlog to 750 milliseconds after
+recent queries and 1 second when those queries experienced queue pressure. The
+worker runs queued queries and ingests before queued maintenance. Candidate
+selection reads the oldest row through the `(ts, series_id)` index instead of
+grouping the entire hot table. A remaining backlog is retried after one second;
+otherwise the next sweep runs after six hours. Database open, workspace-ready,
+and scrape commits do not perform compaction. The exporter reports bounded
+batch count, duration, backlog age, selected pause, requested point limit, and
+the exact number of points moved, so compaction throughput and foreground
+impact can be measured directly.
 
 ### Retention
 
@@ -463,18 +495,26 @@ rather than during database open or after every scrape.
 1. Cold blocks fully before the cutoff are deleted directly.
 2. Cold blocks overlapping the cutoff are decoded, filtered, and rewritten.
 3. Hot rows before the cutoff are deleted.
-4. The plugin prunes series that no longer have samples.
-5. SQLite incremental vacuum runs in bounded chunks.
+4. Exact metadata is finalized in a separate transaction.
+5. Empty series are pruned in a separate operation.
+6. SQLite incremental vacuum runs in bounded chunks.
 
 The plugin aligns the retention cutoff to a six-hour block boundary, then
-advances toward it in batches bounded by physical hot rows and compressed-block
-sample counts. This can retain up to one extra partial block, avoiding expensive
-block rewrites. A pause between batches lets queries and ingests use the worker
-queue. Metadata maintenance reads minute rollups and hot/cold shadow-table
-bounds rather than decoding retained samples, and incremental vacuum runs only
-after a sweep deletes expired physical data and reaches its cutoff. A sweep with
-nothing to delete exits before metadata maintenance and vacuum. Retention is
-therefore proportional to the expired data, not the retained history.
+advances toward it in batches capped at 2,048 physical samples, the maximum
+compressed-block size. This can retain up to one extra partial block, avoiding
+expensive block rewrites. A 250-millisecond pause between batches lets queries
+and ingests use the worker queue. Metadata reconciliation and empty-series
+cleanup are independently queued and separated by another yield, so reaching
+the retention cutoff does not create one large final transaction. Metadata
+maintenance reads minute rollups and indexed hot/cold bounds rather than
+decoding retained samples.
+
+Incremental vacuum is also a recurring bounded phase. It starts at 64 pages,
+adapts between 8 and 256 pages toward a 50-millisecond slice, pauses 500
+milliseconds between slices, and takes a five-second scheduling break after
+every 16 slices. Retention and vacuum work are therefore bounded independently
+of retained history. The exporter reports deletion and finalization durations,
+vacuum pages and freelist backlog, database page count, and the active limits.
 
 ## Worker protocol
 
@@ -485,6 +525,10 @@ messages with monotonically increasing ids. Operations include:
 - `ingest`
 - `importSamples`
 - `select`
+- `compactBeforeBatch`
+- `deleteBeforeBatch`
+- `finalizeRetention`
+- `vacuumBatch`
 - `seriesMatching`
 - `labelNames`
 - `labelValues`
@@ -493,8 +537,12 @@ messages with monotonically increasing ids. Operations include:
 - `stats`
 - `close`
 
-The worker serializes operations internally. This preserves the same single
-SQLite connection invariant as the in-renderer fallback store.
+The worker serializes operations internally. Foreground requests have priority
+over queued maintenance requests, while the currently running bounded slice
+finishes normally. Every response reports request class, queue wait, execution
+duration, and foreground/maintenance queue depth; the renderer exports those
+values as TSDB self-metrics. This preserves the same single SQLite connection
+invariant as the in-renderer fallback store.
 
 Large byte arrays, such as the Wasm binary, are transferred rather than copied.
 

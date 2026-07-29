@@ -32,6 +32,29 @@ import {
 	StoredSample,
 } from "./storage/store";
 import {
+	COMPACTION_BACKLOG_RETRY_MS,
+	COMPACTION_BATCH_MAX_POINTS,
+	COMPACTION_BATCH_PAUSE_MS,
+	COMPACTION_MAX_BATCHES_PER_SWEEP,
+	COMPACTION_SWEEP_MS,
+	compactionPauseMs,
+	compactionPointFloor,
+	nextCompactionPointLimit,
+	STARTUP_COMPACTION_DELAY_MS,
+} from "./storage/compaction";
+import {
+	RETENTION_BATCH_MAX_SAMPLES,
+	RETENTION_BATCH_PAUSE_MS,
+	RETENTION_FINALIZE_PAUSE_MS,
+} from "./storage/retention";
+import {
+	nextVacuumPageLimit,
+	VACUUM_BATCH_INITIAL_PAGES,
+	VACUUM_BATCH_PAUSE_MS,
+	VACUUM_MAX_BATCHES_PER_SWEEP,
+	VACUUM_SWEEP_PAUSE_MS,
+} from "./storage/vacuum";
+import {
 	LegacyStorageMigrationSource,
 	findLegacyStorageMigrationSource,
 	prepareStoreOpenPlan,
@@ -40,6 +63,7 @@ import {
 import { SampleWal } from "./storage/wal";
 import { maintainStartupWal } from "./storage/wal-maintenance";
 import { WorkerMetricsStore } from "./storage/worker-store";
+import type { WorkerRequestTiming } from "./storage/worker-protocol";
 import { createInlineWorkerStoreTransport } from "./storage/worker-transport";
 import { TimeContext } from "./time/context";
 import { parseMarkdownFrontmatter } from "./time/frontmatter";
@@ -68,8 +92,6 @@ declare global {
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
 const STARTUP_RETENTION_DELAY_MS = 60 * 1000;
-const RETENTION_BATCH_MAX_SAMPLES = 100_000;
-const RETENTION_BATCH_PAUSE_MS = 100;
 const WORKER_OPFS_START_ATTEMPTS = 2;
 const WORKER_OPFS_RETRY_DELAY_MS = 5000;
 const PROMQL_BLOCK_RE = /```[ \t]*promql[^\r\n]*(?:\r?\n)([\s\S]*?)(?:\r?\n)```/gi;
@@ -122,7 +144,14 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private flushTimer: number | null = null;
 	private retentionTimer: number | null = null;
 	private startupRetentionTimer: number | null = null;
+	private compactionTimer: number | null = null;
 	private retentionSweepPromise: Promise<void> | null = null;
+	private compactionSweepPromise: Promise<boolean> | null = null;
+	private compactionPointLimit = COMPACTION_BATCH_MAX_POINTS;
+	private compactionBacklogAgeMs = 0;
+	private lastInteractiveQueryAtMs = Number.NEGATIVE_INFINITY;
+	private lastInteractiveQueryQueueWaitMs = 0;
+	private vacuumPageLimit = VACUUM_BATCH_INITIAL_PAGES;
 	private markdownRefreshScheduled = false;
 	private inFlightIngests = new Set<Promise<void>>();
 	private storeHealth: IngestHealth = {
@@ -327,6 +356,11 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			return;
 		}
 		this.store = store;
+		if (store instanceof WorkerMetricsStore) {
+			store.setTimingObserver((timing, status) =>
+				this.observeWorkerRequest(timing, status)
+			);
+		}
 
 		// The WAL remains as a recovery net. Entries are written only after
 		// their SQLite transaction commits, so a healthy database can checkpoint
@@ -520,6 +554,9 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		this.apiServer?.dispose();
 		this.walReplayCancelled = true;
 		await this.waitForWalStartupMaintenance();
+		if (this.store instanceof WorkerMetricsStore) {
+			this.store.setTimingObserver(null);
+		}
 		await this.store?.close().catch((error) => {
 			console.error("tsdb: error closing store", error);
 		});
@@ -913,6 +950,17 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		return String(error);
 	}
 
+	private observeWorkerRequest(
+		timing: WorkerRequestTiming,
+		status: "ok" | "error"
+	): void {
+		this.tsdbMetrics?.recordWorkerRequest(timing, status);
+		if (timing.op === "instantQuery" || timing.op === "rangeQuery") {
+			this.lastInteractiveQueryAtMs = Date.now();
+			this.lastInteractiveQueryQueueWaitMs = timing.queueWaitMs;
+		}
+	}
+
 	restartMaintenanceTimers(): void {
 		this.clearMaintenanceTimers();
 		this.flushTimer = window.setInterval(
@@ -927,6 +975,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			() => this.pruneOldSamples(),
 			RETENTION_SWEEP_MS
 		);
+		this.scheduleCompaction(STARTUP_COMPACTION_DELAY_MS);
 	}
 
 	private clearMaintenanceTimers(): void {
@@ -935,9 +984,127 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		if (this.startupRetentionTimer !== null) {
 			window.clearTimeout(this.startupRetentionTimer);
 		}
+		if (this.compactionTimer !== null) {
+			window.clearTimeout(this.compactionTimer);
+		}
 		this.flushTimer = null;
 		this.retentionTimer = null;
 		this.startupRetentionTimer = null;
+		this.compactionTimer = null;
+	}
+
+	private scheduleCompaction(delayMs: number): void {
+		if (
+			this.isUnloading ||
+			!this.store ||
+			this.compactionTimer !== null ||
+			this.compactionSweepPromise !== null
+		) {
+			return;
+		}
+		this.compactionTimer = window.setTimeout(() => {
+			this.compactionTimer = null;
+			this.compactClosedBuckets();
+		}, Math.max(1000, delayMs));
+	}
+
+	private compactClosedBuckets(): void {
+		if (!this.store || this.compactionSweepPromise) return;
+		const store = this.store;
+		const cutoffMs = Date.now();
+		const sweep = this.runCompactionSweep(store, cutoffMs);
+		this.compactionSweepPromise = sweep;
+		void sweep
+			.catch((error) => {
+				if (!this.isUnloading) {
+					console.error("tsdb: compaction failed", error);
+				}
+			})
+			.finally(() => {
+				if (this.compactionSweepPromise === sweep) {
+					this.compactionSweepPromise = null;
+				}
+				if (!this.isUnloading && this.store === store) {
+					void sweep.then(
+						(complete) =>
+							this.scheduleCompaction(
+								complete
+									? COMPACTION_SWEEP_MS
+									: COMPACTION_BACKLOG_RETRY_MS
+							),
+						() => this.scheduleCompaction(COMPACTION_BACKLOG_RETRY_MS)
+					);
+				}
+			});
+	}
+
+	private async runCompactionSweep(
+		store: MetricsStoreLike,
+		cutoffMs: number
+	): Promise<boolean> {
+		for (
+			let batch = 0;
+			batch < COMPACTION_MAX_BATCHES_PER_SWEEP;
+			batch++
+		) {
+			if (this.isUnloading || this.store !== store) return true;
+			const started = performance.now();
+			let pauseMs = COMPACTION_BATCH_PAUSE_MS;
+			try {
+				const result = await store.compactBeforeBatch(
+					cutoffMs,
+					this.compactionPointLimit
+				);
+				const durationMs = performance.now() - started;
+				this.compactionBacklogAgeMs =
+					result.oldestUncompactedMs === null
+						? 0
+						: Math.max(0, Date.now() - result.oldestUncompactedMs);
+				const recentQueryAgeMs =
+					Date.now() - this.lastInteractiveQueryAtMs;
+				pauseMs = compactionPauseMs({
+					backlogAgeMs: this.compactionBacklogAgeMs,
+					recentQueryAgeMs,
+					recentQueryQueueWaitMs:
+						this.lastInteractiveQueryQueueWaitMs,
+				});
+				this.tsdbMetrics?.recordCompaction(
+					durationMs / 1000,
+					"ok",
+					!result.complete,
+					this.compactionPointLimit,
+					result.compactedPoints,
+					this.compactionBacklogAgeMs / 1000,
+					pauseMs / 1000
+				);
+				if (!result.complete) {
+					this.compactionPointLimit = nextCompactionPointLimit(
+						this.compactionPointLimit,
+						durationMs,
+						compactionPointFloor({
+							backlogAgeMs: this.compactionBacklogAgeMs,
+							recentQueryAgeMs,
+						})
+					);
+				}
+				if (result.complete) return true;
+			} catch (error) {
+				this.tsdbMetrics?.recordCompaction(
+					(performance.now() - started) / 1000,
+					"error",
+					true,
+					this.compactionPointLimit,
+					0,
+					this.compactionBacklogAgeMs / 1000,
+					COMPACTION_BATCH_PAUSE_MS / 1000
+				);
+				throw error;
+			}
+			await new Promise<void>((resolve) =>
+				window.setTimeout(resolve, pauseMs)
+			);
+		}
+		return false;
 	}
 
 	private pruneOldSamples(): void {
@@ -964,14 +1131,112 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		store: MetricsStoreLike,
 		cutoffMs: number
 	): Promise<void> {
+		let finalizedCutoffMs = cutoffMs;
 		while (!this.isUnloading && this.store === store) {
-			const result = await store.deleteBeforeBatch(
-				cutoffMs,
-				RETENTION_BATCH_MAX_SAMPLES
-			);
-			if (result.complete) return;
+			const started = performance.now();
+			try {
+				const result = await store.deleteBeforeBatch(
+					cutoffMs,
+					RETENTION_BATCH_MAX_SAMPLES
+				);
+				this.tsdbMetrics?.recordRetention(
+					(performance.now() - started) / 1000,
+					"ok",
+					!result.complete,
+					RETENTION_BATCH_MAX_SAMPLES,
+					result.deletedSamples ?? 0
+				);
+				if (result.complete) {
+					finalizedCutoffMs = result.cutoffMs;
+					break;
+				}
+			} catch (error) {
+				this.tsdbMetrics?.recordRetention(
+					(performance.now() - started) / 1000,
+					"error",
+					true,
+					RETENTION_BATCH_MAX_SAMPLES,
+					0
+				);
+				throw error;
+			}
 			await new Promise<void>((resolve) =>
 				window.setTimeout(resolve, RETENTION_BATCH_PAUSE_MS)
+			);
+		}
+		if (this.isUnloading || this.store !== store) return;
+		for (const phase of ["metadata", "series"] as const) {
+			await this.runRetentionFinalizePhase(
+				store,
+				finalizedCutoffMs,
+				phase
+			);
+			if (this.isUnloading || this.store !== store) return;
+			await new Promise<void>((resolve) =>
+				window.setTimeout(resolve, RETENTION_FINALIZE_PAUSE_MS)
+			);
+		}
+		await this.runVacuumSweep(store);
+	}
+
+	private async runRetentionFinalizePhase(
+		store: MetricsStoreLike,
+		cutoffMs: number,
+		phase: "metadata" | "series"
+	): Promise<void> {
+		const started = performance.now();
+		try {
+			await store.finalizeRetention(cutoffMs, phase);
+			this.tsdbMetrics?.recordRetentionFinalize(
+				(performance.now() - started) / 1000,
+				phase,
+				"ok"
+			);
+		} catch (error) {
+			this.tsdbMetrics?.recordRetentionFinalize(
+				(performance.now() - started) / 1000,
+				phase,
+				"error"
+			);
+			throw error;
+		}
+	}
+
+	private async runVacuumSweep(store: MetricsStoreLike): Promise<void> {
+		let batches = 0;
+		while (!this.isUnloading && this.store === store) {
+			const pageLimit = this.vacuumPageLimit;
+			const started = performance.now();
+			try {
+				const result = await store.vacuumBatch(pageLimit);
+				const durationMs = performance.now() - started;
+				this.tsdbMetrics?.recordVacuum(
+					durationMs / 1000,
+					"ok",
+					pageLimit,
+					result
+				);
+				if (result.complete || result.reclaimedPages === 0) return;
+				this.vacuumPageLimit = nextVacuumPageLimit(
+					this.vacuumPageLimit,
+					durationMs
+				);
+			} catch (error) {
+				this.tsdbMetrics?.recordVacuum(
+					(performance.now() - started) / 1000,
+					"error",
+					pageLimit,
+					null
+				);
+				throw error;
+			}
+			batches++;
+			const pauseMs =
+				batches % VACUUM_MAX_BATCHES_PER_SWEEP === 0
+					? VACUUM_SWEEP_PAUSE_MS
+					: VACUUM_BATCH_PAUSE_MS;
+			await new Promise<void>((resolve) =>
+				window.setTimeout(resolve, pauseMs)
 			);
 		}
 	}

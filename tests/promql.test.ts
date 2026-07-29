@@ -133,6 +133,50 @@ describe("PromQL engine", () => {
 		}
 	});
 
+	it("uses step-aware reads only for instant-vector selectors", async () => {
+		const rawCalls: string[] = [];
+		const steppedCalls: string[] = [];
+		const ds: DataSource = {
+			select: async (matchers) => {
+				const name = matchers.find(
+					(matcher) => matcher.name === "__name__"
+				)?.value;
+				rawCalls.push(name ?? "");
+				return [
+					{
+						labels: { __name__: name ?? "" },
+						points: [
+							{ t: 0, v: 0 },
+							{ t: 60_000, v: 60 },
+							{ t: 120_000, v: 120 },
+						],
+					},
+				];
+			},
+			selectAtSteps: async (matchers, startMs, endMs, stepMs) => {
+				const name = matchers.find(
+					(matcher) => matcher.name === "__name__"
+				)?.value;
+				steppedCalls.push(name ?? "");
+				return [
+					{
+						labels: { __name__: name ?? "" },
+						points: [
+							{ t: startMs, v: 1 },
+							{ t: Math.min(endMs, startMs + stepMs), v: 2 },
+						],
+					},
+				];
+			},
+		};
+		const engine = new PromQLEngine(ds);
+
+		await engine.rangeQuery("m + rate(c[1m])", 60_000, 120_000, 60_000);
+
+		expect(steppedCalls).toEqual(["m"]);
+		expect(rawCalls).toEqual(["c"]);
+	});
+
 	it("returns nothing when the only sample is outside the lookback window", async () => {
 		const ds = makeDs([
 			{ labels: { __name__: "m" }, points: [{ t: 0, v: 7 }] },

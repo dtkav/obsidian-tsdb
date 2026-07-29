@@ -104,11 +104,12 @@ GROUP BY series_id;
 
 The packed formats are versioned but remain unstable before the first release.
 
-Compact fully closed buckets, with a maximum number of buckets per call:
+Compact one bounded hot slice from a fully closed bucket. The point limit is
+also capped by the virtual table's `max_block_points` setting:
 
 ```sql
 INSERT INTO samples(control, arg1, arg2)
-VALUES ('compact-before', 1700007200000, 16);
+VALUES ('compact-before', 1700007200000, 512);
 ```
 
 Apply retention:

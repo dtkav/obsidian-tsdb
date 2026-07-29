@@ -28,6 +28,10 @@ const sqlite3 = SQLite.Factory(module);
 const seriesCount = Number(process.env.SERIES_COUNT ?? 50);
 const pointsPerSeries = Number(process.env.POINTS_PER_SERIES ?? 720);
 const stepMs = Number(process.env.STEP_MS ?? 30_000);
+const compactionMaxPoints = Number(
+	process.env.COMPACTION_MAX_POINTS ?? 1_000_000
+);
+const compactionBatches = Number(process.env.COMPACTION_BATCHES ?? 1);
 const startMs = 1_700_000_000_000;
 const querySeries = Array.from(
 	{ length: Math.min(10, seriesCount) },
@@ -161,12 +165,22 @@ async function benchmarkTsdb() {
 	await sqlite3.finalize(insert);
 
 	const compactCutoff = startMs + pointsPerSeries * stepMs + 21_600_000;
-	const compactStarted = performance.now();
-	await sqlite3.exec(
-		db,
-		`INSERT INTO samples(control,arg1,arg2) VALUES('compact-before',${compactCutoff},1000000)`
+	const compactBatchMs = [];
+	for (let batch = 0; batch < compactionBatches; batch++) {
+		const compactStarted = performance.now();
+		await sqlite3.exec(
+			db,
+			`INSERT INTO samples(control,arg1,arg2) VALUES('compact-before',${compactCutoff},${compactionMaxPoints})`
+		);
+		compactBatchMs.push(elapsed(compactStarted));
+	}
+	const compactMs = compactBatchMs.reduce((total, value) => total + value, 0);
+	const headRowsAfterCompaction = Number(
+		await scalar(db, "SELECT count(*) FROM samples_head")
 	);
-	const compactMs = elapsed(compactStarted);
+	const blocksAfterCompaction = Number(
+		await scalar(db, "SELECT count(*) FROM samples_blocks")
+	);
 	const sizeBytes = await databaseSize(db);
 
 	let selectedRows = 0;
@@ -200,6 +214,9 @@ async function benchmarkTsdb() {
 	return {
 		ingestMs,
 		compactMs,
+		compactBatchMs,
+		headRowsAfterCompaction,
+		blocksAfterCompaction,
 		queryMs,
 		packedQueryMs,
 		retentionMs,
@@ -220,6 +237,8 @@ console.log(
 				pointsPerSeries,
 				samples: seriesCount * pointsPerSeries,
 				stepMs,
+				compactionMaxPoints,
+				compactionBatches,
 			},
 			baseline,
 			tsdb,

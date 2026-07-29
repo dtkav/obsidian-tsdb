@@ -22,6 +22,13 @@ export interface DataSource {
 		startMs: number,
 		endMs: number
 	): Promise<SeriesData[]>;
+	selectAtSteps?(
+		matchers: Matcher[],
+		startMs: number,
+		endMs: number,
+		stepMs: number,
+		lookbackMs: number
+	): Promise<SeriesData[]>;
 }
 
 /** Raw series data prefetched per selector AST node before evaluation. */
@@ -1134,12 +1141,39 @@ export class PromQLEngine implements PromQLQueryEngine {
 			selectors.map(async (selector) => {
 				const offset = selector.offsetMs;
 				const back = selector.rangeMs ?? this.lookbackMs;
-				const start = times[0] - offset - back;
-				const end = times[times.length - 1] - offset;
-				const key = selectorFetchKey(selector.matchers, start, end);
+				const evalStart = times[0] - offset;
+				const evalEnd = times[times.length - 1] - offset;
+				const useStepSelection =
+					selector.rangeMs === null &&
+					this.ds.selectAtSteps !== undefined;
+				const stepMs =
+					times.length > 1
+						? Math.max(1, times[1] - times[0])
+						: 1;
+				const start = useStepSelection
+					? evalStart
+					: evalStart - back;
+				const key = selectorFetchKey(
+					selector.matchers,
+					start,
+					evalEnd,
+					useStepSelection ? stepMs : null
+				);
 				let fetch = fetches.get(key);
 				if (!fetch) {
-					fetch = this.ds.select(selector.matchers, start, end);
+					fetch = useStepSelection
+						? this.ds.selectAtSteps!(
+								selector.matchers,
+								evalStart,
+								evalEnd,
+								stepMs,
+								this.lookbackMs
+						  )
+						: this.ds.select(
+								selector.matchers,
+								evalStart - back,
+								evalEnd
+						  );
 					fetches.set(key, fetch);
 				}
 				data.set(selector, await fetch);
@@ -1276,7 +1310,8 @@ export { PromQLError };
 function selectorFetchKey(
 	matchers: Matcher[],
 	startMs: number,
-	endMs: number
+	endMs: number,
+	stepMs: number | null = null
 ): string {
 	const normalizedMatchers = matchers
 		.map((matcher) => ({
@@ -1291,5 +1326,5 @@ function selectorFetchKey(
 			if (byOp !== 0) return byOp;
 			return a.value.localeCompare(b.value);
 		});
-	return JSON.stringify([startMs, endMs, normalizedMatchers]);
+	return JSON.stringify([startMs, endMs, stepMs, normalizedMatchers]);
 }

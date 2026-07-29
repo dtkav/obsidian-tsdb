@@ -17,6 +17,7 @@ import {
 	migrateLegacySnapshot,
 	readChunkedDatabaseImage,
 } from "../src/storage/chunk-vfs";
+import { PromQLEngine } from "../src/promql/engine";
 import {
 	NodeFileVFS,
 	nodeStorageDirectoryForAdapter,
@@ -120,6 +121,84 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 			{ t: 1000, v: 1 },
 			{ t: 2000, v: 2 },
 		]);
+		await store.close();
+	});
+
+	it("reads only samples visible at query steps without changing results", async () => {
+		const { store } = await openStore();
+		await store.ingest(
+			Array.from({ length: 181 }, (_, second) => ({
+				labels: { [NAME]: "dense", job: "a" },
+				ts: second * 1000,
+				value: second,
+			}))
+		);
+
+		const matchers = [{ name: NAME, op: "=" as const, value: "dense" }];
+		const raw = await store.select(matchers, 0, 180_000);
+		const stepped = await store.selectAtSteps(
+			matchers,
+			60_000,
+			180_000,
+			30_000,
+			5 * 60_000
+		);
+		expect(raw[0].points).toHaveLength(181);
+		expect(stepped[0].points).toEqual([
+			{ t: 60_000, v: 60 },
+			{ t: 90_000, v: 90 },
+			{ t: 120_000, v: 120 },
+			{ t: 150_000, v: 150 },
+			{ t: 180_000, v: 180 },
+		]);
+
+		const optimized = new PromQLEngine(store);
+		const rawOnly = new PromQLEngine({
+			select: (requestedMatchers, startMs, endMs) =>
+				store.select(requestedMatchers, startMs, endMs),
+		});
+		expect(
+			await optimized.rangeQuery("dense", 60_000, 180_000, 30_000)
+		).toEqual(
+			await rawOnly.rangeQuery("dense", 60_000, 180_000, 30_000)
+		);
+		expect(
+			await optimized.rangeQuery(
+				"dense offset 1m",
+				120_000,
+				180_000,
+				30_000
+			)
+		).toEqual(
+			await rawOnly.rangeQuery(
+				"dense offset 1m",
+				120_000,
+				180_000,
+				30_000
+			)
+		);
+		await store.close();
+	});
+
+	it("preserves the strict lookback boundary in step-aware reads", async () => {
+		const { store } = await openStore();
+		await store.ingest([
+			{ labels: { [NAME]: "stale" }, ts: 0, value: 1 },
+		]);
+		const matchers = [{ name: NAME, op: "=" as const, value: "stale" }];
+		expect(
+			await store.selectAtSteps(
+				matchers,
+				5 * 60_000,
+				5 * 60_000,
+				1,
+				5 * 60_000
+			)
+		).toEqual([]);
+
+		const optimized = new PromQLEngine(store);
+		const result = await optimized.instantQuery("stale", 5 * 60_000);
+		expect(result).toMatchObject({ resultType: "vector", result: [] });
 		await store.close();
 	});
 
@@ -252,6 +331,102 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		await store.close();
 	});
 
+	it("compacts closed hot rows in bounded slices", async () => {
+		const { store } = await openStore();
+		const blockSpanMs = 6 * 60 * 60 * 1000;
+		const cutoff = Math.floor(Date.now() / blockSpanMs) * blockSpanMs;
+		const sampleTs = cutoff - 1000;
+		await store.ingest(
+			["a", "b", "c"].map((job, index) => ({
+				labels: { [NAME]: "m", job },
+				ts: sampleTs,
+				value: index,
+			}))
+		);
+
+		expect(await store.compactBeforeBatch(cutoff, 1)).toEqual({
+			complete: false,
+			cutoffMs: cutoff,
+			compactedPoints: 1,
+			oldestUncompactedMs: sampleTs,
+		});
+		expect((await store.compactBeforeBatch(cutoff, 1)).complete).toBe(
+			false
+		);
+		expect(await store.compactBeforeBatch(cutoff, 1)).toEqual({
+			complete: true,
+			cutoffMs: cutoff,
+			compactedPoints: 1,
+			oldestUncompactedMs: null,
+		});
+		expect(await store.compactBeforeBatch(cutoff, 1)).toEqual({
+			complete: true,
+			cutoffMs: cutoff,
+			compactedPoints: 0,
+			oldestUncompactedMs: null,
+		});
+
+		const data = await store.select(
+			[{ name: NAME, op: "=", value: "m" }],
+			sampleTs,
+			sampleTs
+		);
+		expect(data).toHaveLength(3);
+		await store.close();
+	});
+
+	it("preserves queries and late overwrites across partial compaction", async () => {
+		const { store } = await openStore();
+		const blockSpanMs = 6 * 60 * 60 * 1000;
+		const cutoff = Math.floor(Date.now() / blockSpanMs) * blockSpanMs;
+		const base = cutoff - 20 * 60 * 1000;
+		const samples = Array.from({ length: 1200 }, (_, index) => ({
+			labels: { [NAME]: "partial" },
+			ts: base + index * 1000,
+			value: index,
+		}));
+		await store.ingest(samples);
+
+		expect(await store.compactBeforeBatch(cutoff, 512)).toEqual({
+			complete: false,
+			cutoffMs: cutoff,
+			compactedPoints: 512,
+			oldestUncompactedMs: base + 512 * 1000,
+		});
+		let data = await store.select(
+			[{ name: NAME, op: "=", value: "partial" }],
+			base,
+			cutoff
+		);
+		expect(data[0].points).toHaveLength(1200);
+
+		await store.ingest([
+			{
+				labels: { [NAME]: "partial" },
+				ts: base + 100 * 1000,
+				value: 9999,
+			},
+		]);
+		expect((await store.compactBeforeBatch(cutoff, 128)).complete).toBe(false);
+
+		let complete = false;
+		for (let batch = 0; batch < 10 && !complete; batch++) {
+			complete = (await store.compactBeforeBatch(cutoff, 512)).complete;
+		}
+		expect(complete).toBe(true);
+		data = await store.select(
+			[{ name: NAME, op: "=", value: "partial" }],
+			base,
+			cutoff
+		);
+		expect(data[0].points).toHaveLength(1200);
+		expect(data[0].points[100]).toEqual({
+			t: base + 100 * 1000,
+			v: 9999,
+		});
+		await store.close();
+	});
+
 	it("bounds retention work by physical storage samples", async () => {
 		const { store } = await openStore();
 		const blockSpanMs = 6 * 60 * 60 * 1000;
@@ -282,16 +457,62 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 		expect(third.complete).toBe(true);
 		expect(third.cutoffMs).toBe(target);
 		expect(third.deletedSamples).toBe(1);
+		// Completion only covers bounded physical deletion. Exact logical
+		// metadata and empty-series cleanup run as separately scheduled phases.
+		expect((await store.quickStats()).sampleCount).toBe(3);
+		await store.finalizeRetention(target, "metadata");
+		await store.finalizeRetention(target, "series");
 		expect(await store.quickStats()).toMatchObject({
 			sampleCount: 0,
 			oldestSampleMs: null,
 			newestSampleMs: null,
+		});
+		// Retried phases are safe after a reload or interrupted scheduler.
+		await store.finalizeRetention(target, "metadata");
+		await store.finalizeRetention(target, "series");
+		expect(await store.quickStats()).toMatchObject({
+			seriesCount: 0,
+			sampleCount: 0,
 		});
 		expect(await store.deleteBeforeBatch(target, 1)).toEqual({
 			complete: true,
 			cutoffMs: target,
 			deletedSamples: 0,
 		});
+		await store.close();
+	});
+
+	it("reclaims free pages in bounded incremental-vacuum batches", async () => {
+		const { store } = await openStore();
+		const blockSpanMs = 6 * 60 * 60 * 1000;
+		const cutoff = Math.floor(Date.now() / blockSpanMs) * blockSpanMs;
+		const samples = Array.from({ length: 500 }, (_, index) => ({
+			labels: {
+				[NAME]: "vacuum",
+				instance: `${String(index).padStart(4, "0")}-${"x".repeat(96)}`,
+			},
+			ts: cutoff - 1000,
+			value: index,
+		}));
+		await store.ingest(samples);
+		let deletion = await store.deleteBeforeBatch(cutoff, 2048);
+		while (!deletion.complete) {
+			deletion = await store.deleteBeforeBatch(cutoff, 2048);
+		}
+		await store.finalizeRetention(deletion.cutoffMs, "metadata");
+		await store.finalizeRetention(deletion.cutoffMs, "series");
+
+		let result = await store.vacuumBatch(1);
+		expect(result.pageSize).toBeGreaterThan(0);
+		expect(result.reclaimedPages).toBeLessThanOrEqual(1);
+		const initialRemaining = result.remainingPages;
+		for (let batch = 0; batch < 1000 && !result.complete; batch++) {
+			const previousRemaining = result.remainingPages;
+			result = await store.vacuumBatch(8);
+			expect(result.remainingPages).toBeLessThanOrEqual(previousRemaining);
+			if (result.reclaimedPages === 0) break;
+		}
+		expect(result.remainingPages).toBeLessThanOrEqual(initialRemaining);
 		await store.close();
 	});
 

@@ -2,6 +2,7 @@ import type { MetricsStoreLike } from "./store";
 import { PromQLError } from "../promql/ast";
 import { PromQLEngine } from "../promql/engine";
 import type {
+	WorkerRequestClass,
 	WorkerStoreRequest,
 	WorkerStoreResponse,
 } from "./worker-protocol";
@@ -20,10 +21,18 @@ export type WorkerStoreOpenHandler = (
 	request: WorkerStoreOpenRequest
 ) => Promise<MetricsStoreLike>;
 
+interface QueuedRequest {
+	request: WorkerStoreRequest;
+	queuedAt: number;
+	requestClass: WorkerRequestClass;
+}
+
 export class WorkerStoreServer {
 	private store: MetricsStoreLike | null = null;
 	private queryEngine: PromQLEngine | null = null;
-	private queue: Promise<unknown> = Promise.resolve();
+	private foregroundQueue: QueuedRequest[] = [];
+	private maintenanceQueue: QueuedRequest[] = [];
+	private dispatching = false;
 	private unsubscribe: (() => void) | null;
 	private closed = false;
 
@@ -58,16 +67,48 @@ export class WorkerStoreServer {
 			});
 			return;
 		}
-		const run = this.queue.then(
-			() => this.dispatch(request),
-			() => this.dispatch(request)
-		);
-		this.queue = run.then(
-			() => undefined,
-			() => undefined
-		);
+		const requestClass = isMaintenanceRequest(request)
+			? "maintenance"
+			: "foreground";
+		const queue =
+			requestClass === "maintenance"
+				? this.maintenanceQueue
+				: this.foregroundQueue;
+		queue.push({
+			request,
+			queuedAt: performance.now(),
+			requestClass,
+		});
+		this.drainQueue();
+	}
+
+	private drainQueue(): void {
+		if (this.dispatching) return;
+		const queued =
+			this.foregroundQueue.shift() ?? this.maintenanceQueue.shift();
+		if (!queued) return;
+		const { request } = queued;
+		const started = performance.now();
+		const timingBase = {
+			op: request.op,
+			requestClass: queued.requestClass,
+			queueWaitMs: started - queued.queuedAt,
+			foregroundQueueDepth: this.foregroundQueue.length,
+			maintenanceQueueDepth: this.maintenanceQueue.length,
+		};
+		this.dispatching = true;
+		const run = this.dispatch(request);
 		void run.then(
-			(value) => this.transport.post({ id: request.id, ok: true, value }),
+			(value) =>
+				this.transport.post({
+					id: request.id,
+					ok: true,
+					value,
+					timing: {
+						...timingBase,
+						durationMs: performance.now() - started,
+					},
+				}),
 			(error) => {
 				const message = error instanceof Error ? error.message : String(error);
 				this.transport.post(
@@ -77,11 +118,26 @@ export class WorkerStoreServer {
 								ok: false,
 								error: message,
 								errorType: error.errorType,
+								timing: {
+									...timingBase,
+									durationMs: performance.now() - started,
+								},
 						  }
-						: { id: request.id, ok: false, error: message }
+						: {
+								id: request.id,
+								ok: false,
+								error: message,
+								timing: {
+									...timingBase,
+									durationMs: performance.now() - started,
+								},
+						  }
 				);
 			}
-		);
+		).finally(() => {
+			this.dispatching = false;
+			this.drainQueue();
+		});
 	}
 
 	private async dispatch(request: WorkerStoreRequest) {
@@ -131,6 +187,18 @@ export class WorkerStoreServer {
 					request.cutoffMs,
 					request.maxSamples
 				);
+			case "compactBeforeBatch":
+				return this.requireStore().compactBeforeBatch(
+					request.cutoffMs,
+					request.maxPoints
+				);
+			case "finalizeRetention":
+				return this.requireStore().finalizeRetention(
+					request.cutoffMs,
+					request.phase
+				);
+			case "vacuumBatch":
+				return this.requireStore().vacuumBatch(request.maxPages);
 			case "quickStats":
 				return this.requireStore().quickStats();
 			case "stats":
@@ -163,4 +231,13 @@ export class WorkerStoreServer {
 		}
 		return this.queryEngine;
 	}
+}
+
+function isMaintenanceRequest(request: WorkerStoreRequest): boolean {
+	return (
+		request.op === "compactBeforeBatch" ||
+		request.op === "deleteBeforeBatch" ||
+		request.op === "finalizeRetention" ||
+		request.op === "vacuumBatch"
+	);
 }

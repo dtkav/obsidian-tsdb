@@ -81,27 +81,91 @@ describe("plugin startup lifecycle", () => {
 		const text = methodInFile("src/storage/store.ts", "init").getText();
 
 		expect(text).not.toContain("await this.compactBefore");
-		expect(text).toContain("this.nextCompactionMs = nextBlockBoundary(now)");
+		expect(text).not.toContain("nextCompaction");
+	});
+
+	it("runs compaction as delayed, interleaved maintenance", () => {
+		const config = readFileSync("src/storage/compaction.ts", "utf8");
+		const timers = pluginMethod("restartMaintenanceTimers").getText();
+		const sweep = pluginMethod("runCompactionSweep").getText();
+		const ingest = methodInFile(
+			"src/storage/store.ts",
+			"ingestLocked"
+		).getText();
+
+		expect(timers).toContain(
+			"this.scheduleCompaction(STARTUP_COMPACTION_DELAY_MS)"
+		);
+		expect(sweep).toContain("store.compactBeforeBatch");
+		expect(sweep).toContain("this.compactionPointLimit");
+		expect(sweep).toContain("nextCompactionPointLimit");
+		expect(sweep).toContain("COMPACTION_BATCH_PAUSE_MS");
+		expect(config).toContain("COMPACTION_BATCH_MAX_POINTS = 512");
+		expect(config).toContain("COMPACTION_BACKLOG_RETRY_MS = 1000");
+		expect(ingest).not.toContain("compactBefore");
+	});
+
+	it("moves only one bounded hot slice per compaction transaction", () => {
+		const source = readFileSync("sqlite-tsdb/src/sqlite_tsdb.c", "utf8");
+		const start = source.indexOf("static int compact_before");
+		const end = source.indexOf("static int delete_before", start);
+		const text = source.slice(start, end);
+
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		expect(text).toContain("compact_hot_slice");
+		expect(text).toContain("compact_overlapping_block");
+		expect(text).not.toContain("while (");
+	});
+
+	it("selects compaction work without grouping the hot table", () => {
+		const source = readFileSync("sqlite-tsdb/src/sqlite_tsdb.c", "utf8");
+		const start = source.indexOf("static int find_oldest_compactable_bucket");
+		const end = source.indexOf("static int compact_before", start);
+		const text = source.slice(start, end);
+
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		expect(text).toContain('INDEXED BY \\"%w_ts\\"');
+		expect(text).toContain("ORDER BY ts,series_id LIMIT 1");
+		expect(text).not.toContain("GROUP BY");
 	});
 
 	it("does not scan all retained samples to maintain retention metadata", () => {
-		const text = methodInFile(
+		const deletion = methodInFile(
 			"src/storage/store.ts",
 			"deleteBeforeLocked"
 		).getText();
+		const bounds = methodInFile(
+			"src/storage/store.ts",
+			"refreshKnownSampleBounds"
+		).getText();
+		const series = methodInFile(
+			"src/storage/store.ts",
+			"pruneEmptySeriesLocked"
+		).getText();
 
-		expect(text).not.toContain("SELECT count(*) FROM samples WHERE ts < ?");
-		expect(text).toContain("collectRetentionCounts");
-		expect(text).toContain("samples_head");
-		expect(text).toContain("samples_blocks");
+		expect(deletion).not.toContain(
+			"SELECT count(*) FROM samples WHERE ts < ?"
+		);
+		expect(deletion).toContain("collectRetentionCounts");
+		expect(bounds).toContain("samples_head");
+		expect(bounds).toContain("samples_blocks");
+		expect(series).toContain("NOT EXISTS");
+		expect(series).toContain("samples_head.series_id = series.id");
+		expect(series).toContain("samples_blocks.series_id = series.id");
 	});
 
 	it("runs retention as interleaved bounded batches", () => {
+		const config = readFileSync("src/storage/retention.ts", "utf8");
 		const text = pluginMethod("runRetentionSweep").getText();
 
 		expect(text).toContain("store.deleteBeforeBatch");
 		expect(text).toContain("RETENTION_BATCH_MAX_SAMPLES");
 		expect(text).toContain("RETENTION_BATCH_PAUSE_MS");
+		expect(text).toContain("recordRetention");
+		expect(config).toContain("RETENTION_BATCH_MAX_SAMPLES = 2_048");
+		expect(config).toContain("RETENTION_BATCH_PAUSE_MS = 250");
 	});
 
 	it("exits a retention no-op before transaction and vacuum work", () => {

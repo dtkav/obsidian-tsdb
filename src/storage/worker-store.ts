@@ -2,14 +2,18 @@ import type { Labels, Matcher } from "../labels";
 import { PromQLError } from "../promql/ast";
 import type { ApiResultData, PromQLQueryEngine } from "../promql/engine";
 import type {
+	CompactionBatchResult,
 	MetricsStoreLike,
 	QuickStoreStats,
 	RetentionDeleteResult,
+	RetentionFinalizePhase,
 	SeriesData,
 	StoredSample,
 	StoreStats,
+	VacuumBatchResult,
 } from "./store";
 import type {
+	WorkerRequestTiming,
 	WorkerStoreOpenResult,
 	WorkerStoreRequest,
 	WorkerStoreRequestBody,
@@ -45,6 +49,12 @@ export class WorkerMetricsStore implements MetricsStoreLike, PromQLQueryEngine {
 	private closed = false;
 	private closePromise: Promise<void> | null = null;
 	private recovered = false;
+	private timingObserver:
+		| ((
+				timing: WorkerRequestTiming,
+				status: "ok" | "error"
+		  ) => void)
+		| null = null;
 
 	private constructor(private transport: WorkerStoreTransport) {
 		this.unsubscribe = transport.onMessage((response) =>
@@ -91,6 +101,17 @@ export class WorkerMetricsStore implements MetricsStoreLike, PromQLQueryEngine {
 
 	get recoveredFromCorruption(): boolean {
 		return this.recovered;
+	}
+
+	setTimingObserver(
+		observer:
+			| ((
+					timing: WorkerRequestTiming,
+					status: "ok" | "error"
+			  ) => void)
+			| null
+	): void {
+		this.timingObserver = observer;
 	}
 
 	ingest(samples: StoredSample[]): Promise<void> {
@@ -149,6 +170,35 @@ export class WorkerMetricsStore implements MetricsStoreLike, PromQLQueryEngine {
 			op: "deleteBeforeBatch",
 			cutoffMs,
 			maxSamples,
+		});
+	}
+
+	compactBeforeBatch(
+		cutoffMs: number,
+		maxPoints: number
+	): Promise<CompactionBatchResult> {
+		return this.request<CompactionBatchResult>({
+			op: "compactBeforeBatch",
+			cutoffMs,
+			maxPoints,
+		});
+	}
+
+	finalizeRetention(
+		cutoffMs: number,
+		phase: RetentionFinalizePhase
+	): Promise<void> {
+		return this.request<void>({
+			op: "finalizeRetention",
+			cutoffMs,
+			phase,
+		});
+	}
+
+	vacuumBatch(maxPages: number): Promise<VacuumBatchResult> {
+		return this.request<VacuumBatchResult>({
+			op: "vacuumBatch",
+			maxPages,
 		});
 	}
 
@@ -270,6 +320,16 @@ export class WorkerMetricsStore implements MetricsStoreLike, PromQLQueryEngine {
 		if (!pending) return;
 		this.pending.delete(response.id);
 		this.notifyIdle();
+		if (response.timing && this.timingObserver) {
+			try {
+				this.timingObserver(
+					response.timing,
+					response.ok ? "ok" : "error"
+				);
+			} catch {
+				// Observability must never affect request completion.
+			}
+		}
 		if (response.ok) {
 			pending.resolve(response.value);
 		} else {

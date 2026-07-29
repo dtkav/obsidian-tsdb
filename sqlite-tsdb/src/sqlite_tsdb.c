@@ -16,6 +16,7 @@ SQLITE_EXTENSION_INIT1
 
 #define TSDB_DEFAULT_BLOCK_SPAN_MS 21600000LL
 #define TSDB_DEFAULT_MAX_BLOCK_POINTS 2048
+#define TSDB_DEFAULT_COMPACTION_POINTS 512
 #define TSDB_MAX_QUERY_POINTS 10000000
 
 #define PLAN_SERIES_EQ 0x0001
@@ -57,6 +58,7 @@ typedef struct TsdbCursor {
 typedef struct TsdbBucket {
     sqlite3_int64 series_id;
     sqlite3_int64 bucket_start_ms;
+    sqlite3_int64 timestamp_ms;
 } TsdbBucket;
 
 typedef struct TsdbBatchVtab {
@@ -580,6 +582,7 @@ static int load_one_series(
     sqlite3_finalize(statement);
     statement = NULL;
     if (rc != SQLITE_OK) goto done;
+    cold_count = sort_and_deduplicate(cold, cold_count);
 
     rc = prepare_format(
         vtab->db,
@@ -987,6 +990,426 @@ static int write_bucket_blocks(
     return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
+static int append_bucket_blocks(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    const TsdbRow *rows,
+    int row_count) {
+    sqlite3_stmt *statement = NULL;
+    sqlite3_stmt *insert_statement = NULL;
+    int next_chunk_no = 0;
+    int offset;
+    int rc;
+
+    rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT coalesce(max(chunk_no),-1)+1 FROM \"%w\" "
+        "WHERE series_id=?1 AND bucket_start_ms=?2",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, bucket_start);
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_ROW) {
+        next_chunk_no = sqlite3_column_int(statement, 0);
+        rc = SQLITE_OK;
+    }
+    sqlite3_finalize(statement);
+    if (rc != SQLITE_OK || row_count == 0) return rc;
+
+    rc = prepare_format(
+        vtab->db,
+        &insert_statement,
+        "INSERT INTO \"%w\"(series_id,bucket_start_ms,chunk_no,min_ts,max_ts,"
+        "sample_count,codec,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+
+    for (offset = 0; offset < row_count; offset += vtab->max_block_points) {
+        int count = row_count - offset;
+        TsdbCodecPoint *points;
+        unsigned char *payload = NULL;
+        size_t payload_size = 0;
+        int codec = 0;
+        int codec_rc;
+        int i;
+        if (count > vtab->max_block_points) count = vtab->max_block_points;
+        points = (TsdbCodecPoint *)malloc((size_t)count * sizeof(*points));
+        if (!points) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        for (i = 0; i < count; ++i) {
+            points[i].timestamp_ms = rows[offset + i].timestamp_ms;
+            points[i].value_bits = rows[offset + i].value_bits;
+        }
+        codec_rc = tsdb_block_encode(
+            points,
+            (uint32_t)count,
+            &payload,
+            &payload_size,
+            &codec);
+        free(points);
+        if (codec_rc != TSDB_CODEC_OK) {
+            free(payload);
+            rc = codec_rc == TSDB_CODEC_NOMEM ? SQLITE_NOMEM : SQLITE_ERROR;
+            break;
+        }
+        sqlite3_bind_int64(insert_statement, 1, series_id);
+        sqlite3_bind_int64(insert_statement, 2, bucket_start);
+        sqlite3_bind_int(insert_statement, 3, next_chunk_no++);
+        sqlite3_bind_int64(insert_statement, 4, rows[offset].timestamp_ms);
+        sqlite3_bind_int64(
+            insert_statement,
+            5,
+            rows[offset + count - 1].timestamp_ms);
+        sqlite3_bind_int(insert_statement, 6, count);
+        sqlite3_bind_int(insert_statement, 7, codec);
+        sqlite3_bind_blob64(
+            insert_statement,
+            8,
+            payload,
+            (sqlite3_uint64)payload_size,
+            SQLITE_TRANSIENT);
+        rc = sqlite3_step(insert_statement);
+        free(payload);
+        if (rc != SQLITE_DONE) break;
+        if (!vtab->cold_max_known ||
+            rows[offset + count - 1].timestamp_ms > vtab->cold_max_timestamp) {
+            vtab->cold_max_timestamp = rows[offset + count - 1].timestamp_ms;
+            vtab->cold_max_known = 1;
+        }
+        sqlite3_reset(insert_statement);
+        sqlite3_clear_bindings(insert_statement);
+    }
+    sqlite3_finalize(insert_statement);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int load_hot_slice(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 lower,
+    sqlite3_int64 upper,
+    int limit,
+    TsdbRow **rows,
+    int *row_count) {
+    sqlite3_stmt *statement = NULL;
+    int capacity = 0;
+    int count = 0;
+    int rc;
+
+    *rows = NULL;
+    *row_count = 0;
+    rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT ts,value_bits FROM \"%w\" "
+        "WHERE series_id=?1 AND ts>=?2 AND ts<=?3 ORDER BY ts LIMIT ?4",
+        vtab->head_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, lower);
+    sqlite3_bind_int64(statement, 3, upper);
+    sqlite3_bind_int(statement, 4, limit);
+    while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        rc = append_row(
+            rows,
+            &count,
+            &capacity,
+            series_id,
+            sqlite3_column_int64(statement, 0),
+            sql_int_to_bits(sqlite3_column_int64(statement, 1)),
+            1);
+        if (rc != SQLITE_OK) break;
+    }
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    sqlite3_finalize(statement);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(*rows);
+        *rows = NULL;
+        return rc;
+    }
+    *row_count = count;
+    return SQLITE_OK;
+}
+
+static int load_overlapping_block(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    sqlite3_int64 timestamp_ms,
+    int *found,
+    int *chunk_no,
+    sqlite3_int64 *min_ts,
+    sqlite3_int64 *max_ts,
+    TsdbRow **rows,
+    int *row_count) {
+    sqlite3_stmt *statement = NULL;
+    TsdbCodecPoint *decoded = NULL;
+    uint32_t decoded_count = 0;
+    int codec = 0;
+    int rc;
+    uint32_t i;
+
+    *found = 0;
+    *rows = NULL;
+    *row_count = 0;
+    rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT chunk_no,min_ts,max_ts,payload FROM \"%w\" "
+        "WHERE series_id=?1 AND bucket_start_ms=?2 "
+        "AND min_ts<=?3 AND max_ts>=?3 ORDER BY chunk_no LIMIT 1",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, bucket_start);
+    sqlite3_bind_int64(statement, 3, timestamp_ms);
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        return SQLITE_OK;
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        return rc;
+    }
+
+    *chunk_no = sqlite3_column_int(statement, 0);
+    *min_ts = sqlite3_column_int64(statement, 1);
+    *max_ts = sqlite3_column_int64(statement, 2);
+    rc = tsdb_block_decode(
+        sqlite3_column_blob(statement, 3),
+        (size_t)sqlite3_column_bytes(statement, 3),
+        &decoded,
+        &decoded_count,
+        &codec);
+    (void)codec;
+    sqlite3_finalize(statement);
+    if (rc != TSDB_CODEC_OK ||
+        decoded_count > (uint32_t)vtab->max_block_points) {
+        free(decoded);
+        return SQLITE_CORRUPT_VTAB;
+    }
+    if (decoded_count > 0) {
+        *rows = (TsdbRow *)sqlite3_malloc64(
+            (sqlite3_uint64)decoded_count * sizeof(**rows));
+        if (!*rows) {
+            free(decoded);
+            return SQLITE_NOMEM;
+        }
+    }
+    for (i = 0; i < decoded_count; ++i) {
+        (*rows)[i].series_id = series_id;
+        (*rows)[i].timestamp_ms = decoded[i].timestamp_ms;
+        (*rows)[i].value_bits = decoded[i].value_bits;
+        (*rows)[i].hot = 0;
+    }
+    free(decoded);
+    *row_count = (int)decoded_count;
+    *found = 1;
+    return SQLITE_OK;
+}
+
+static int delete_block(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    int chunk_no) {
+    sqlite3_stmt *statement = NULL;
+    int rc = prepare_format(
+        vtab->db,
+        &statement,
+        "DELETE FROM \"%w\" "
+        "WHERE series_id=?1 AND bucket_start_ms=?2 AND chunk_no=?3",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, bucket_start);
+    sqlite3_bind_int(statement, 3, chunk_no);
+    rc = sqlite3_step(statement);
+    sqlite3_finalize(statement);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int delete_hot_range(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 lower,
+    sqlite3_int64 upper) {
+    sqlite3_stmt *statement = NULL;
+    int rc = prepare_format(
+        vtab->db,
+        &statement,
+        "DELETE FROM \"%w\" "
+        "WHERE series_id=?1 AND ts>=?2 AND ts<=?3",
+        vtab->head_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, lower);
+    sqlite3_bind_int64(statement, 3, upper);
+    rc = sqlite3_step(statement);
+    sqlite3_finalize(statement);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int next_block_min_timestamp(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    sqlite3_int64 timestamp_ms,
+    sqlite3_int64 *next_min,
+    int *found) {
+    sqlite3_stmt *statement = NULL;
+    int rc;
+    *found = 0;
+    rc = prepare_format(
+        vtab->db,
+        &statement,
+        "SELECT min(min_ts) FROM \"%w\" "
+        "WHERE series_id=?1 AND bucket_start_ms=?2 AND min_ts>?3",
+        vtab->blocks_name);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(statement, 1, series_id);
+    sqlite3_bind_int64(statement, 2, bucket_start);
+    sqlite3_bind_int64(statement, 3, timestamp_ms);
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_ROW) {
+        if (sqlite3_column_type(statement, 0) != SQLITE_NULL) {
+            *next_min = sqlite3_column_int64(statement, 0);
+            *found = 1;
+        }
+        rc = SQLITE_OK;
+    }
+    sqlite3_finalize(statement);
+    return rc;
+}
+
+static int compact_hot_slice(
+    TsdbVtab *vtab,
+    const TsdbBucket *bucket,
+    int limit,
+    sqlite3_int64 *compacted_points) {
+    sqlite3_int64 bucket_end =
+        bucket->bucket_start_ms + vtab->block_span_ms - 1;
+    sqlite3_int64 upper = bucket_end;
+    sqlite3_int64 next_min = 0;
+    TsdbRow *hot = NULL;
+    int hot_count = 0;
+    int found_next = 0;
+    int rc = next_block_min_timestamp(
+        vtab,
+        bucket->series_id,
+        bucket->bucket_start_ms,
+        bucket->timestamp_ms,
+        &next_min,
+        &found_next);
+    if (rc != SQLITE_OK) return rc;
+    if (found_next && next_min <= upper) upper = next_min - 1;
+    rc = load_hot_slice(
+        vtab,
+        bucket->series_id,
+        bucket->timestamp_ms,
+        upper,
+        limit,
+        &hot,
+        &hot_count);
+    if (rc != SQLITE_OK) return rc;
+    if (hot_count == 0) {
+        sqlite3_free(hot);
+        return SQLITE_OK;
+    }
+    rc = append_bucket_blocks(
+        vtab,
+        bucket->series_id,
+        bucket->bucket_start_ms,
+        hot,
+        hot_count);
+    if (rc == SQLITE_OK) {
+        rc = delete_hot_range(
+            vtab,
+            bucket->series_id,
+            hot[0].timestamp_ms,
+            hot[hot_count - 1].timestamp_ms);
+    }
+    if (rc == SQLITE_OK) *compacted_points = hot_count;
+    sqlite3_free(hot);
+    return rc;
+}
+
+static int compact_overlapping_block(
+    TsdbVtab *vtab,
+    const TsdbBucket *bucket,
+    int chunk_no,
+    sqlite3_int64 min_ts,
+    sqlite3_int64 max_ts,
+    TsdbRow *cold,
+    int cold_count,
+    int limit,
+    sqlite3_int64 *compacted_points) {
+    TsdbRow *hot = NULL;
+    TsdbRow *combined = NULL;
+    int hot_count = 0;
+    int combined_count;
+    int rc = load_hot_slice(
+        vtab,
+        bucket->series_id,
+        min_ts,
+        max_ts,
+        limit,
+        &hot,
+        &hot_count);
+    if (rc != SQLITE_OK) goto done;
+    if (hot_count == 0) {
+        rc = SQLITE_OK;
+        goto done;
+    }
+    combined = (TsdbRow *)sqlite3_malloc64(
+        (sqlite3_uint64)(cold_count + hot_count) * sizeof(*combined));
+    if (!combined) {
+        rc = SQLITE_NOMEM;
+        goto done;
+    }
+    memcpy(combined, cold, (size_t)cold_count * sizeof(*combined));
+    memcpy(
+        combined + cold_count,
+        hot,
+        (size_t)hot_count * sizeof(*combined));
+    combined_count = sort_and_deduplicate(
+        combined,
+        cold_count + hot_count);
+
+    rc = delete_block(
+        vtab,
+        bucket->series_id,
+        bucket->bucket_start_ms,
+        chunk_no);
+    if (rc == SQLITE_OK) {
+        rc = append_bucket_blocks(
+            vtab,
+            bucket->series_id,
+            bucket->bucket_start_ms,
+            combined,
+            combined_count);
+    }
+    if (rc == SQLITE_OK) {
+        rc = delete_hot_range(
+            vtab,
+            bucket->series_id,
+            hot[0].timestamp_ms,
+            hot[hot_count - 1].timestamp_ms);
+    }
+    if (rc == SQLITE_OK) *compacted_points = hot_count;
+
+done:
+    sqlite3_free(hot);
+    sqlite3_free(combined);
+    return rc;
+}
+
 static int compact_bucket(
     TsdbVtab *vtab,
     sqlite3_int64 series_id,
@@ -1030,50 +1453,101 @@ static int append_bucket(
     return SQLITE_OK;
 }
 
-static int compact_before(TsdbVtab *vtab, sqlite3_int64 cutoff, int limit) {
+static int find_oldest_compactable_bucket(
+    TsdbVtab *vtab,
+    sqlite3_int64 cutoff,
+    TsdbBucket *bucket,
+    int *found) {
     sqlite3_stmt *statement = NULL;
-    TsdbBucket *buckets = NULL;
-    int bucket_count = 0;
-    int capacity = 0;
     int rc;
-    int i;
-    if (limit <= 0) limit = 16;
+    *found = 0;
     rc = prepare_format(
         vtab->db,
         &statement,
-        "SELECT series_id, ts-(ts%%?1) AS bucket_start "
-        "FROM \"%w\" "
-        "WHERE (ts-(ts%%?1))+?1<=?2 "
-        "GROUP BY series_id, bucket_start ORDER BY bucket_start, series_id LIMIT ?3",
+        "SELECT series_id,ts FROM \"%w\" INDEXED BY \"%w_ts\" "
+        "WHERE ts<?1 ORDER BY ts,series_id LIMIT 1",
+        vtab->head_name,
         vtab->head_name);
     if (rc != SQLITE_OK) return rc;
-    sqlite3_bind_int64(statement, 1, vtab->block_span_ms);
-    sqlite3_bind_int64(statement, 2, cutoff);
-    sqlite3_bind_int(statement, 3, limit);
-    while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
-        rc = append_bucket(
-            &buckets,
-            &bucket_count,
-            &capacity,
-            sqlite3_column_int64(statement, 0),
-            sqlite3_column_int64(statement, 1));
-        if (rc != SQLITE_OK) break;
+    sqlite3_bind_int64(statement, 1, cutoff);
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_ROW) {
+        sqlite3_int64 timestamp_ms = sqlite3_column_int64(statement, 1);
+        bucket->series_id = sqlite3_column_int64(statement, 0);
+        bucket->timestamp_ms = timestamp_ms;
+        bucket->bucket_start_ms =
+            timestamp_ms - (timestamp_ms % vtab->block_span_ms);
+        *found = 1;
+        rc = SQLITE_OK;
+    } else if (rc == SQLITE_DONE) {
+        rc = SQLITE_OK;
     }
-    if (rc == SQLITE_DONE) rc = SQLITE_OK;
     sqlite3_finalize(statement);
-    if (rc != SQLITE_OK) {
-        sqlite3_free(buckets);
-        return rc;
-    }
-    for (i = 0; i < bucket_count; ++i) {
-        rc = compact_bucket(
+    return rc;
+}
+
+static int compact_before(
+    TsdbVtab *vtab,
+    sqlite3_int64 cutoff,
+    sqlite3_int64 max_points,
+    sqlite3_int64 *compacted_points) {
+    sqlite3_int64 closed_before;
+    TsdbBucket bucket;
+    TsdbRow *cold = NULL;
+    sqlite3_int64 min_ts = 0;
+    sqlite3_int64 max_ts = 0;
+    int cold_count = 0;
+    int chunk_no = 0;
+    int found = 0;
+    int limit;
+    int rc;
+
+    *compacted_points = 0;
+    if (cutoff <= 0) return SQLITE_OK;
+    closed_before = (cutoff / vtab->block_span_ms) * vtab->block_span_ms;
+    if (closed_before <= 0) return SQLITE_OK;
+    if (max_points <= 0) max_points = TSDB_DEFAULT_COMPACTION_POINTS;
+    limit = max_points > vtab->max_block_points
+        ? vtab->max_block_points
+        : (int)max_points;
+
+    rc = find_oldest_compactable_bucket(
+        vtab,
+        closed_before,
+        &bucket,
+        &found);
+    if (rc != SQLITE_OK || !found) return rc;
+    rc = load_overlapping_block(
+        vtab,
+        bucket.series_id,
+        bucket.bucket_start_ms,
+        bucket.timestamp_ms,
+        &found,
+        &chunk_no,
+        &min_ts,
+        &max_ts,
+        &cold,
+        &cold_count);
+    if (rc != SQLITE_OK) return rc;
+    if (found) {
+        rc = compact_overlapping_block(
             vtab,
-            buckets[i].series_id,
-            buckets[i].bucket_start_ms,
-            0);
-        if (rc != SQLITE_OK) break;
+            &bucket,
+            chunk_no,
+            min_ts,
+            max_ts,
+            cold,
+            cold_count,
+            limit,
+            compacted_points);
+    } else {
+        rc = compact_hot_slice(
+            vtab,
+            &bucket,
+            limit,
+            compacted_points);
     }
-    sqlite3_free(buckets);
+    sqlite3_free(cold);
     return rc;
 }
 
@@ -1370,13 +1844,17 @@ static int tsdb_update(
         const char *control = (const char *)sqlite3_value_text(argv[5]);
         if (!control) return SQLITE_NOMEM;
         if (strcmp(control, "compact-before") == 0) {
+            sqlite3_int64 compacted_points = 0;
             if (sqlite3_value_type(argv[6]) != SQLITE_INTEGER) return SQLITE_MISMATCH;
             rc = compact_before(
                 vtab,
                 sqlite3_value_int64(argv[6]),
                 sqlite3_value_type(argv[7]) == SQLITE_INTEGER
-                    ? sqlite3_value_int(argv[7])
-                    : 16);
+                    ? sqlite3_value_int64(argv[7])
+                    : TSDB_DEFAULT_COMPACTION_POINTS,
+                &compacted_points);
+            *rowid = compacted_points;
+            return rc;
         } else if (strcmp(control, "delete-before") == 0) {
             if (sqlite3_value_type(argv[6]) != SQLITE_INTEGER) return SQLITE_MISMATCH;
             rc = delete_before(vtab, sqlite3_value_int64(argv[6]));
