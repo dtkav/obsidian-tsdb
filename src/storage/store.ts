@@ -1562,7 +1562,11 @@ export class MetricsStore implements MetricsStoreLike {
 				} finally {
 					this.vfs = null;
 				}
-				if (closeError !== null) throw closeError;
+				if (closeError !== null) {
+					throw closeError instanceof Error
+						? closeError
+						: new Error(String(closeError));
+				}
 			})
 			.then(
 				() => {

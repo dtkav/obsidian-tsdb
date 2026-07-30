@@ -65,7 +65,7 @@ export class TimeSelectorController {
 	constructor(plugin: ObsidianMetricsPlugin, context: TimeContext) {
 		this.plugin = plugin;
 		this.context = context;
-		this.statusEl = activeDocument.createElement("div");
+		this.statusEl = createEl("div");
 		this.statusEl.addClass("tsdb-time-status");
 		this.statusEl.setAttr("aria-label", "TSDB time range");
 		this.statusEl.setAttr("aria-expanded", "false");

@@ -893,7 +893,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 								wasmBinary: this.getSyncWasmBinary(),
 							}
 						);
-						console.log("tsdb: using worker OPFS backend");
 						this.storageBackend = "worker-opfs";
 						return store;
 					} catch (error) {
@@ -1364,9 +1363,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 					return;
 				}
 				if (result.aborted) {
-					console.log(
-						`tsdb: WAL replay stopped after ${result.samples} samples`
-					);
 					this.tsdbMetrics?.recordWalReplay(
 						result.samples,
 						result.batches,
@@ -1375,11 +1371,6 @@ export default class ObsidianMetricsPlugin extends Plugin {
 						"aborted"
 					);
 					return;
-				}
-				if (result.samples > 0 || result.bytes > 0) {
-					console.log(
-						`tsdb: replayed ${result.samples} samples from write-ahead log`
-					);
 				}
 				this.tsdbMetrics?.recordWalReplay(
 					result.samples,
