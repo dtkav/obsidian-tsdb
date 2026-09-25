@@ -27,6 +27,15 @@ make -C /path/to/wa-sqlite-1.0.0 \
   dist/wa-sqlite.mjs dist/wa-sqlite-async.mjs
 ```
 
+The version-specific overlay links `libvfs.js` from this directory in place of
+the upstream copy. It is the upstream file at that commit with 64-bit file
+offsets read correctly: the C bridge passes `sqlite3_int64` offsets and sizes
+by pointer, and Emscripten's `getValue(ptr, 'i64')` without `WASM_BIGINT`
+loads only the low 32 bits, so past 2 GiB the JavaScript VFS would receive a
+wrapped negative offset and SQLite would read and write the wrong pages. The
+`u64()` helper combines both 32-bit halves; `tests/vfs-large-offsets.test.ts`
+in the plugin drives a database past 2 GiB to keep it that way.
+
 The output `.mjs` and `.wasm` files are wa-sqlite artifacts with the TSDB code
 linked in. The build also preserves Emscripten's `wasmBinary` factory input so
 the artifact can be embedded in an Obsidian bundle. The upstream SQLite

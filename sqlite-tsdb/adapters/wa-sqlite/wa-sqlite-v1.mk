@@ -8,6 +8,12 @@ override CFLAGS_COMMON = \
 	-I'$(SQLITE_TSDB_DIR)/src' \
 	-Wno-non-literal-null-conversion
 
+# The JavaScript VFS bridge is vendored with 64-bit offsets read correctly;
+# see libvfs.js beside this makefile.
+override EMFLAGS_LIBRARIES = \
+	--js-library src/libfunction.js \
+	--js-library src/libmodule.js \
+	--js-library '$(SQLITE_TSDB_DIR)/adapters/wa-sqlite/libvfs.js'
 override EMFLAGS_COMMON = \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s WASM=1 \
