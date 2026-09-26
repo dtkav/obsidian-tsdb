@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# The history must stand alone: no bug-tracker ids, no test-plan ids, no
+# wikilinks, no dev-tooling names, no agent session trailers. Subjects are
+# plain imperative sentences; there is no type prefix.
+set -euo pipefail
+
+msg_file="$1"
+
+pattern='(BUG-?[0-9]+|\bTP-?[0-9]{2,3}\b|\btp[0-9]{3}\b|\[\[|relay-harness|run-test-plan-suite|\bigit\b|\b(Codex|Claude)-Session[[:space:]]*:|Co-Authored-By:.*(Claude|Codex)|Generated with \[?Claude)'
+if matches=$(grep -v '^#' "$msg_file" | grep -Ein "$pattern"); then
+  echo "commit-msg: message references internal tooling, tickets or an agent session; describe the change on its own terms instead:" >&2
+  echo "$matches" >&2
+  exit 1
+fi
+
+exit 0
