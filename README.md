@@ -37,9 +37,16 @@ the browser-managed storage area available to Obsidian's renderer.
 
 Metric data lives in OPFS, separate from the plugin files.
 
-Each scrape batch is committed as a SQLite transaction. Retention pruning keeps
-the database within the configured history window. The default retention is 30
-days; change it in **Settings -> Community plugins -> TSDB -> Database**.
+Each scrape batch is committed as a SQLite transaction. New samples land as
+plain rows, which cost about 40 bytes each; a background compaction pass moves
+everything older than a few minutes into delta-encoded blocks, where a sample
+costs a few bytes (about two for values that rarely change). Compaction is
+paced by throughput so it keeps up with per-second sampling of hundreds of
+series without starving foreground queries. Retention pruning keeps the
+database within the configured history window, and a size guard forces
+retention and compaction early if the file crosses 1 GiB. The default
+retention is 30 days; change it in **Settings -> Community plugins -> TSDB ->
+Database**.
 
 ## Charting in notes
 

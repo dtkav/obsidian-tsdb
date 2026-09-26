@@ -107,6 +107,7 @@ class FakeStore implements MetricsStoreLike {
 			cutoffMs,
 			compactedPoints: 0,
 			oldestUncompactedMs: null,
+			droppedCorruptBlocks: 0,
 		};
 	}
 	async finalizeRetention(
@@ -266,6 +267,7 @@ describe("WorkerStoreServer", () => {
 				cutoffMs: 21_600_000,
 				compactedPoints: 0,
 				oldestUncompactedMs: null,
+				droppedCorruptBlocks: 0,
 			},
 		});
 
@@ -364,6 +366,7 @@ describe("WorkerStoreServer", () => {
 				cutoffMs,
 				compactedPoints: 0,
 				oldestUncompactedMs: null,
+				droppedCorruptBlocks: 0,
 			};
 		};
 		store.stats = async () => {

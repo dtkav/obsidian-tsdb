@@ -41,6 +41,10 @@ export interface TsdbMetricsRecorder {
 		sampleLimit: number,
 		deletedSamples: number
 	): void;
+	/** Undecodable blocks the extension dropped during maintenance. */
+	recordDroppedBlocks(count: number): void;
+	/** The store crossed a size guard and maintenance was forced. */
+	recordStoreSizeGuard(reason: "size" | "full"): void;
 	recordRetentionFinalize(
 		durationSeconds: number,
 		phase: "metadata" | "series",
@@ -148,6 +152,15 @@ export function setupTsdbMetrics(
 	const compactionPause = metricsAPI.createGauge({
 		name: "tsdb_compaction_pause_seconds",
 		help: "Foreground scheduling pause selected after the latest compaction slice",
+	});
+	const droppedBlocks = metricsAPI.createCounter({
+		name: "tsdb_corrupt_blocks_dropped_total",
+		help: "Undecodable compressed blocks dropped by compaction or retention",
+	});
+	const storeSizeGuard = metricsAPI.createCounter({
+		name: "tsdb_store_size_guard_total",
+		help: "Times the store crossed a size guard and maintenance was forced",
+		labelNames: ["reason"],
 	});
 	const retentionBatches = metricsAPI.createCounter({
 		name: "tsdb_retention_batches_total",
@@ -322,6 +335,12 @@ export function setupTsdbMetrics(
 			compactionPointLimit.set(pointLimit);
 			compactionBacklogAge.set(backlogAgeSeconds);
 			compactionPause.set(pauseSeconds);
+		},
+		recordDroppedBlocks(count) {
+			if (count > 0) droppedBlocks.inc(count);
+		},
+		recordStoreSizeGuard(reason) {
+			storeSizeGuard.inc(1, { reason });
 		},
 		recordRetention(
 			durationSeconds,

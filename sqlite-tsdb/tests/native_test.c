@@ -85,7 +85,88 @@ static void assert_value(
     sqlite3_finalize(statement);
 }
 
+static void assert_step_fails(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *statement = NULL;
+    int rc;
+    assert(sqlite3_prepare_v2(db, sql, -1, &statement, NULL) == SQLITE_OK);
+    rc = sqlite3_step(statement);
+    assert(rc != SQLITE_ROW && rc != SQLITE_DONE);
+    sqlite3_finalize(statement);
+}
+
+/*
+ * Compaction takes an exact cutoff: hot rows older than it move into
+ * blocks even while their bucket is still open, and later slices append
+ * as new chunks. Undecodable blocks fail queries but are dropped by the
+ * maintenance paths so compaction and retention keep moving.
+ */
+static void test_open_bucket_cutoff_and_corrupt_blocks(void) {
+    sqlite3 *db = NULL;
+    char sql[160];
+    int i;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_tsdb_register(db) == SQLITE_OK);
+    execute(
+        db,
+        "CREATE VIRTUAL TABLE samples USING tsdb("
+        "block_span_ms=1000,max_block_points=64)");
+    for (i = 0; i < 20; ++i) {
+        snprintf(
+            sql,
+            sizeof(sql),
+            "INSERT INTO samples(series_id,ts,value) VALUES(1,%d,%d.5)",
+            i * 100,
+            i);
+        execute(db, sql);
+    }
+    execute(
+        db,
+        "INSERT INTO samples(control,arg1,arg2) "
+        "VALUES('compact-before',250,100)");
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 17);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") == 1);
+    assert(scalar_i64(db, "SELECT max(max_ts) FROM samples_blocks") == 200);
+    execute(
+        db,
+        "INSERT INTO samples(control,arg1,arg2) "
+        "VALUES('compact-before',650,100)");
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 13);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") == 2);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples") == 20);
+    assert_value(db, 1, 300, 3.5);
+
+    execute(db, "UPDATE samples_blocks SET payload=x'00' WHERE chunk_no=0");
+    assert_step_fails(db, "SELECT count(*) FROM samples WHERE series_id=1");
+    execute(db, "INSERT INTO samples(series_id,ts,value) VALUES(1,150,7.5)");
+    for (i = 0; i < 10 && scalar_i64(db, "SELECT count(*) FROM samples_head") > 0; ++i) {
+        execute(
+            db,
+            "INSERT INTO samples(control,arg1,arg2) "
+            "VALUES('compact-before',2000,100)");
+    }
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_head") == 0);
+    assert(scalar_i64(db, "SELECT tsdb_dropped_blocks()") == 1);
+    assert(scalar_i64(
+               db,
+               "SELECT count(*) FROM samples_blocks "
+               "WHERE bucket_start_ms=0 AND chunk_no=0") == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples") == 18);
+    assert_value(db, 1, 150, 7.5);
+    assert_value(db, 1, 300, 3.5);
+
+    execute(db, "UPDATE samples_blocks SET payload=x'00' WHERE bucket_start_ms=1000");
+    execute(db, "INSERT INTO samples(control,arg1) VALUES('delete-before',1500)");
+    assert(scalar_i64(db, "SELECT tsdb_dropped_blocks()") == 2);
+    /* Everything before 1500 is gone by retention; the rows at and after
+     * it were only in the undecodable chunk, which is gone with it. */
+    assert(scalar_i64(db, "SELECT count(*) FROM samples") == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM samples_blocks") == 0);
+    assert_integrity(db);
+    sqlite3_close(db);
+}
+
 int main(void) {
+    test_open_bucket_cutoff_and_corrupt_blocks();
     sqlite3 *db = NULL;
     sqlite3_stmt *insert = NULL;
     int i;

@@ -61,6 +61,28 @@ typedef struct TsdbBucket {
     sqlite3_int64 timestamp_ms;
 } TsdbBucket;
 
+typedef struct TsdbBlockKey {
+    sqlite3_int64 series_id;
+    sqlite3_int64 bucket_start_ms;
+    int chunk_no;
+} TsdbBlockKey;
+
+/*
+ * Blocks whose payload no longer decodes are unreadable whatever else
+ * happens to them. Queries still report them as corruption, but the
+ * maintenance paths (compaction and retention) drop them and move on:
+ * retrying the same undecodable block every second would stall both jobs
+ * for good while hot rows piled up behind them. The count is process-wide
+ * and exposed through tsdb_dropped_blocks() so the host can surface it.
+ */
+static sqlite3_int64 g_dropped_corrupt_blocks = 0;
+
+static int drop_corrupt_block(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    int chunk_no);
+
 typedef struct TsdbBatchVtab {
     sqlite3_vtab base;
 } TsdbBatchVtab;
@@ -513,12 +535,16 @@ static int load_one_series(
     sqlite3_int64 series_id,
     sqlite3_int64 lower,
     sqlite3_int64 upper,
+    int drop_corrupt,
     TsdbRow **rows,
     int *row_count) {
     sqlite3_stmt *statement = NULL;
     TsdbRow *cold = NULL;
     TsdbRow *hot = NULL;
     TsdbRow *merged = NULL;
+    TsdbBlockKey *corrupt = NULL;
+    int corrupt_count = 0;
+    int corrupt_capacity = 0;
     int cold_count = 0;
     int cold_capacity = 0;
     int hot_count = 0;
@@ -526,12 +552,13 @@ static int load_one_series(
     int cold_index = 0;
     int hot_index = 0;
     int merged_count = 0;
+    int i;
     int rc;
 
     rc = prepare_format(
         vtab->db,
         &statement,
-        "SELECT payload FROM \"%w\" "
+        "SELECT payload,bucket_start_ms,chunk_no FROM \"%w\" "
         "WHERE series_id=?1 AND min_ts<=?2 AND max_ts>=?3 "
         "ORDER BY bucket_start_ms,chunk_no",
         vtab->blocks_name);
@@ -545,7 +572,6 @@ static int load_one_series(
         TsdbCodecPoint *decoded = NULL;
         uint32_t decoded_count = 0;
         int codec = 0;
-        uint32_t i;
         int codec_rc = tsdb_block_decode(
             payload,
             (size_t)payload_size,
@@ -556,13 +582,34 @@ static int load_one_series(
         if (codec_rc != TSDB_CODEC_OK ||
             decoded_count > (uint32_t)vtab->max_block_points) {
             free(decoded);
-            rc = SQLITE_CORRUPT_VTAB;
-            break;
+            if (!drop_corrupt) {
+                rc = SQLITE_CORRUPT_VTAB;
+                break;
+            }
+            /* Remember the key; the delete waits until this scan is done. */
+            if (corrupt_count == corrupt_capacity) {
+                int next_capacity = corrupt_capacity ? corrupt_capacity * 2 : 4;
+                TsdbBlockKey *grown = (TsdbBlockKey *)sqlite3_realloc64(
+                    corrupt,
+                    (sqlite3_uint64)next_capacity * sizeof(*grown));
+                if (!grown) {
+                    rc = SQLITE_NOMEM;
+                    break;
+                }
+                corrupt = grown;
+                corrupt_capacity = next_capacity;
+            }
+            corrupt[corrupt_count].series_id = series_id;
+            corrupt[corrupt_count].bucket_start_ms =
+                sqlite3_column_int64(statement, 1);
+            corrupt[corrupt_count].chunk_no = sqlite3_column_int(statement, 2);
+            ++corrupt_count;
+            continue;
         }
         rc = SQLITE_OK;
-        for (i = 0; i < decoded_count; ++i) {
-            if (decoded[i].timestamp_ms < lower ||
-                decoded[i].timestamp_ms > upper) {
+        for (uint32_t d = 0; d < decoded_count; ++d) {
+            if (decoded[d].timestamp_ms < lower ||
+                decoded[d].timestamp_ms > upper) {
                 continue;
             }
             rc = append_row(
@@ -570,8 +617,8 @@ static int load_one_series(
                 &cold_count,
                 &cold_capacity,
                 series_id,
-                decoded[i].timestamp_ms,
-                decoded[i].value_bits,
+                decoded[d].timestamp_ms,
+                decoded[d].value_bits,
                 0);
             if (rc != SQLITE_OK) break;
         }
@@ -582,6 +629,14 @@ static int load_one_series(
     sqlite3_finalize(statement);
     statement = NULL;
     if (rc != SQLITE_OK) goto done;
+    for (i = 0; i < corrupt_count; ++i) {
+        rc = drop_corrupt_block(
+            vtab,
+            corrupt[i].series_id,
+            corrupt[i].bucket_start_ms,
+            corrupt[i].chunk_no);
+        if (rc != SQLITE_OK) goto done;
+    }
     cold_count = sort_and_deduplicate(cold, cold_count);
 
     rc = prepare_format(
@@ -640,6 +695,7 @@ static int load_one_series(
 
 done:
     sqlite3_finalize(statement);
+    sqlite3_free(corrupt);
     sqlite3_free(cold);
     sqlite3_free(hot);
     sqlite3_free(merged);
@@ -652,6 +708,7 @@ static int load_rows(
     sqlite3_int64 series_id,
     sqlite3_int64 lower,
     sqlite3_int64 upper,
+    int drop_corrupt,
     TsdbRow **rows,
     int *row_count) {
     sqlite3_stmt *statement = NULL;
@@ -665,6 +722,7 @@ static int load_rows(
             series_id,
             lower,
             upper,
+            drop_corrupt,
             rows,
             row_count);
     }
@@ -813,6 +871,7 @@ static int tsdb_filter(
         series_id,
         lower,
         upper,
+        0,
         &cursor->rows,
         &cursor->row_count);
     if (rc == SQLITE_CORRUPT_VTAB) {
@@ -873,6 +932,7 @@ static int load_bucket(
         series_id,
         bucket_start,
         bucket_end,
+        1,
         rows,
         row_count);
 }
@@ -1192,7 +1252,7 @@ static int load_overlapping_block(
     if (rc != TSDB_CODEC_OK ||
         decoded_count > (uint32_t)vtab->max_block_points) {
         free(decoded);
-        return SQLITE_CORRUPT_VTAB;
+        return drop_corrupt_block(vtab, series_id, bucket_start, *chunk_no);
     }
     if (decoded_count > 0) {
         *rows = (TsdbRow *)sqlite3_malloc64(
@@ -1233,6 +1293,23 @@ static int delete_block(
     rc = sqlite3_step(statement);
     sqlite3_finalize(statement);
     return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int drop_corrupt_block(
+    TsdbVtab *vtab,
+    sqlite3_int64 series_id,
+    sqlite3_int64 bucket_start,
+    int chunk_no) {
+    int rc = delete_block(vtab, series_id, bucket_start, chunk_no);
+    if (rc != SQLITE_OK) return rc;
+    ++g_dropped_corrupt_blocks;
+    sqlite3_log(
+        SQLITE_WARNING,
+        "tsdb: dropped undecodable block series=%lld bucket=%lld chunk=%d",
+        (long long)series_id,
+        (long long)bucket_start,
+        chunk_no);
+    return SQLITE_OK;
 }
 
 static int delete_hot_range(
@@ -1291,11 +1368,15 @@ static int next_block_min_timestamp(
 static int compact_hot_slice(
     TsdbVtab *vtab,
     const TsdbBucket *bucket,
+    sqlite3_int64 cutoff,
     int limit,
     sqlite3_int64 *compacted_points) {
     sqlite3_int64 bucket_end =
         bucket->bucket_start_ms + vtab->block_span_ms - 1;
     sqlite3_int64 upper = bucket_end;
+    /* Rows at or after the cutoff stay hot; a caller that wants a lag
+     * behind real time expresses it through the cutoff. */
+    if (cutoff - 1 < upper) upper = cutoff - 1;
     sqlite3_int64 next_min = 0;
     TsdbRow *hot = NULL;
     int hot_count = 0;
@@ -1504,8 +1585,12 @@ static int compact_before(
 
     *compacted_points = 0;
     if (cutoff <= 0) return SQLITE_OK;
-    closed_before = (cutoff / vtab->block_span_ms) * vtab->block_span_ms;
-    if (closed_before <= 0) return SQLITE_OK;
+    /* Any hot row older than the cutoff is compactable, including rows of
+     * the bucket that is still open. Chunks of an open bucket accumulate
+     * in time order, so later slices append after the last chunk instead
+     * of merging into it; only out-of-order arrivals hit the overlapping
+     * path. */
+    closed_before = cutoff;
     if (max_points <= 0) max_points = TSDB_DEFAULT_COMPACTION_POINTS;
     limit = max_points > vtab->max_block_points
         ? vtab->max_block_points
@@ -1544,6 +1629,7 @@ static int compact_before(
         rc = compact_hot_slice(
             vtab,
             &bucket,
+            closed_before,
             limit,
             compacted_points);
     }
@@ -2223,10 +2309,30 @@ static sqlite3_module batch_module = {
     NULL
 };
 
+static void dropped_blocks_function(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv) {
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int64(context, g_dropped_corrupt_blocks);
+}
+
 int sqlite3_tsdb_register(sqlite3 *db) {
     int rc = sqlite3_create_module_v2(db, "tsdb", &tsdb_module, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
     rc = sqlite3_create_module_v2(db, "tsdb_batch", &batch_module, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function_v2(
+        db,
+        "tsdb_dropped_blocks",
+        0,
+        SQLITE_UTF8 | SQLITE_INNOCUOUS,
+        NULL,
+        dropped_blocks_function,
+        NULL,
+        NULL,
+        NULL);
     if (rc != SQLITE_OK) return rc;
     rc = sqlite3_create_function_v2(
         db,

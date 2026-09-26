@@ -86,14 +86,16 @@ export interface VacuumBatchResult {
 }
 
 export interface CompactionBatchResult {
-	/** True when no closed hot rows remain before the aligned cutoff. */
+	/** True when no hot rows remain before the cutoff. */
 	complete: boolean;
-	/** Six-hour-aligned exclusive cutoff used by this bounded chunk. */
+	/** Exclusive cutoff used by this bounded chunk; any hot row older than it is compactable. */
 	cutoffMs: number;
 	/** Hot points moved into compressed blocks by this transaction. */
 	compactedPoints: number;
-	/** Oldest closed hot point still awaiting compaction. */
+	/** Oldest hot point still awaiting compaction. */
 	oldestUncompactedMs: number | null;
+	/** Undecodable blocks the extension dropped while compacting this batch. */
+	droppedCorruptBlocks: number;
 }
 
 export interface OpenOptions {
@@ -210,6 +212,18 @@ const SELECT_SERIES_BATCH_SIZE = 250;
 const SELECT_PACKED_CHUNK_SIZE = 65_536;
 const TSDB_BLOCK_SPAN_MS = 21_600_000;
 const INCREMENTAL_VACUUM_PAGES = 256;
+/**
+ * Hard ceiling on the database file. Retention and continuous compaction
+ * keep a healthy store far below it; reaching it turns silent growth into
+ * SQLITE_FULL on ingest, which the plugin answers with an immediate
+ * retention sweep.
+ */
+export const STORE_HARD_LIMIT_BYTES = 4 * 1024 * 1024 * 1024;
+/**
+ * Soft guard: a store this large means retention or compaction fell
+ * behind, so the plugin forces both instead of waiting for their timers.
+ */
+export const STORE_SIZE_GUARD_BYTES = 1024 * 1024 * 1024;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS series (
@@ -358,6 +372,13 @@ export class MetricsStore implements MetricsStoreLike {
 		await this.sqlite3.exec(this.db, "PRAGMA journal_size_limit=4194304");
 		await this.sqlite3.exec(this.db, "PRAGMA cache_size=-16384"); // 16 MiB
 		await this.sqlite3.exec(this.db, "PRAGMA temp_store=MEMORY");
+		const pageSize = await this.readPragmaNumber("page_size");
+		if (pageSize > 0) {
+			await this.sqlite3.exec(
+				this.db,
+				`PRAGMA max_page_count=${Math.floor(STORE_HARD_LIMIT_BYTES / pageSize)}`
+			);
+		}
 		await this.requireCompatibleSampleSchema();
 		await this.sqlite3.exec(this.db, SCHEMA);
 		await this.loadSeriesCache();
@@ -1082,8 +1103,10 @@ export class MetricsStore implements MetricsStoreLike {
 		cutoffMs: number,
 		maxPoints: number
 	): Promise<CompactionBatchResult> {
-		const targetCutoffMs =
-			Math.floor(cutoffMs / TSDB_BLOCK_SPAN_MS) * TSDB_BLOCK_SPAN_MS;
+		// The cutoff is exact: the extension compacts every hot row older
+		// than it, including rows of the bucket that is still open, so the
+		// caller keeps only a short window of raw rows behind real time.
+		const targetCutoffMs = Math.floor(cutoffMs);
 		const oldestBefore =
 			targetCutoffMs > 0
 				? await this.oldestUncompactedBefore(targetCutoffMs)
@@ -1094,10 +1117,12 @@ export class MetricsStore implements MetricsStoreLike {
 				cutoffMs: targetCutoffMs,
 				compactedPoints: 0,
 				oldestUncompactedMs: null,
+				droppedCorruptBlocks: 0,
 			};
 		}
 
 		let compactedPoints = 0;
+		const droppedBefore = await this.droppedCorruptBlocks();
 		await this.sqlite3.exec(this.db, "BEGIN");
 		try {
 			compactedPoints = await this.compactBefore(
@@ -1117,7 +1142,31 @@ export class MetricsStore implements MetricsStoreLike {
 			cutoffMs: targetCutoffMs,
 			compactedPoints,
 			oldestUncompactedMs,
+			droppedCorruptBlocks: Math.max(
+				0,
+				(await this.droppedCorruptBlocks()) - droppedBefore
+			),
 		};
+	}
+
+	/**
+	 * Process-wide count of undecodable blocks the extension has dropped
+	 * during maintenance. Zero on a build that predates the counter.
+	 */
+	private async droppedCorruptBlocks(): Promise<number> {
+		let dropped = 0;
+		try {
+			await this.sqlite3.exec(
+				this.db,
+				"SELECT tsdb_dropped_blocks()",
+				(row) => {
+					dropped = Number(row[0] ?? 0);
+				}
+			);
+		} catch {
+			dropped = 0;
+		}
+		return dropped;
 	}
 
 	private async deleteBeforeBatchLocked(

@@ -100,8 +100,13 @@ describe("plugin startup lifecycle", () => {
 		expect(sweep).toContain("this.compactionPointLimit");
 		expect(sweep).toContain("nextCompactionPointLimit");
 		expect(sweep).toContain("COMPACTION_BATCH_PAUSE_MS");
-		expect(config).toContain("COMPACTION_BATCH_MAX_POINTS = 512");
+		expect(config).toContain("COMPACTION_BATCH_MAX_POINTS = 2048");
+		expect(config).toContain("COMPACTION_BATCH_MIN_POINTS = 512");
 		expect(config).toContain("COMPACTION_BACKLOG_RETRY_MS = 1000");
+		// Compaction trails real time by a short hot window rather than
+		// waiting for a block-span boundary.
+		const scheduler = pluginMethod("compactClosedBuckets").getText();
+		expect(scheduler).toContain("Date.now() - COMPACTION_HOT_WINDOW_MS");
 		expect(ingest).not.toContain("compactBefore");
 	});
 

@@ -1,8 +1,11 @@
-export const VACUUM_BATCH_MIN_PAGES = 8;
-export const VACUUM_BATCH_MAX_PAGES = 256;
-export const VACUUM_BATCH_INITIAL_PAGES = 64;
-export const VACUUM_BATCH_TARGET_MS = 50;
-export const VACUUM_BATCH_PAUSE_MS = 500;
+// Vacuum pacing. Like compaction, a vacuum batch is mostly fixed cost, so
+// the page limit moves within a band whose floor still reclaims space
+// faster than retention frees it.
+export const VACUUM_BATCH_MIN_PAGES = 64;
+export const VACUUM_BATCH_MAX_PAGES = 1024;
+export const VACUUM_BATCH_INITIAL_PAGES = 256;
+export const VACUUM_BATCH_TARGET_MS = 250;
+export const VACUUM_BATCH_PAUSE_MS = 250;
 export const VACUUM_MAX_BATCHES_PER_SWEEP = 16;
 export const VACUUM_SWEEP_PAUSE_MS = 5000;
 

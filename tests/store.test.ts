@@ -349,6 +349,7 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 			cutoffMs: cutoff,
 			compactedPoints: 1,
 			oldestUncompactedMs: sampleTs,
+			droppedCorruptBlocks: 0,
 		});
 		expect((await store.compactBeforeBatch(cutoff, 1)).complete).toBe(
 			false
@@ -358,12 +359,14 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 			cutoffMs: cutoff,
 			compactedPoints: 1,
 			oldestUncompactedMs: null,
+			droppedCorruptBlocks: 0,
 		});
 		expect(await store.compactBeforeBatch(cutoff, 1)).toEqual({
 			complete: true,
 			cutoffMs: cutoff,
 			compactedPoints: 0,
 			oldestUncompactedMs: null,
+			droppedCorruptBlocks: 0,
 		});
 
 		const data = await store.select(
@@ -372,6 +375,48 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 			sampleTs
 		);
 		expect(data).toHaveLength(3);
+		await store.close();
+	});
+
+	it("compacts hot rows older than an exact cutoff inside the open bucket", async () => {
+		const { store } = await openStore();
+		const blockSpanMs = 6 * 60 * 60 * 1000;
+		const bucketStart = Math.floor(Date.now() / blockSpanMs) * blockSpanMs;
+		// Ten rows one second apart, all inside the bucket that is still open.
+		const base = bucketStart + 60 * 1000;
+		await store.ingest(
+			Array.from({ length: 10 }, (_, index) => ({
+				labels: { [NAME]: "open" },
+				ts: base + index * 1000,
+				value: index,
+			}))
+		);
+		const cutoff = base + 4 * 1000 + 500;
+		expect(await store.compactBeforeBatch(cutoff, 512)).toEqual({
+			complete: true,
+			cutoffMs: cutoff,
+			compactedPoints: 5,
+			oldestUncompactedMs: null,
+			droppedCorruptBlocks: 0,
+		});
+		// The five newer rows are still hot; a later cutoff appends them as
+		// a further chunk rather than merging into the first.
+		expect(await store.compactBeforeBatch(base + 60 * 1000, 512)).toEqual({
+			complete: true,
+			cutoffMs: base + 60 * 1000,
+			compactedPoints: 5,
+			oldestUncompactedMs: null,
+			droppedCorruptBlocks: 0,
+		});
+		const data = await store.select(
+			[{ name: NAME, op: "=", value: "open" }],
+			base,
+			base + 10 * 1000
+		);
+		expect(data).toHaveLength(1);
+		expect(data[0].points.map((point) => point.v)).toEqual([
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+		]);
 		await store.close();
 	});
 
@@ -392,6 +437,7 @@ describe("MetricsStore (wa-sqlite over chunked adapter VFS)", () => {
 			cutoffMs: cutoff,
 			compactedPoints: 512,
 			oldestUncompactedMs: base + 512 * 1000,
+			droppedCorruptBlocks: 0,
 		});
 		let data = await store.select(
 			[{ name: NAME, op: "=", value: "partial" }],

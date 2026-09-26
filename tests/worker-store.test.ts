@@ -344,6 +344,7 @@ describe("WorkerMetricsStore", () => {
 			cutoffMs: 21_600_000,
 			compactedPoints: 512,
 			oldestUncompactedMs: 10_000,
+			droppedCorruptBlocks: 0,
 		});
 
 		expect(await compacting).toEqual({
@@ -351,6 +352,7 @@ describe("WorkerMetricsStore", () => {
 			cutoffMs: 21_600_000,
 			compactedPoints: 512,
 			oldestUncompactedMs: 10_000,
+			droppedCorruptBlocks: 0,
 		});
 	});
 

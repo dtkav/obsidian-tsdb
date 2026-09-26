@@ -194,3 +194,74 @@ describe.skipIf(!process.env.TSDB_BENCH_LIMITS)("compaction batch cost by size",
 		}
 	}, 1_800_000);
 });
+
+// Bytes per sample in the hot head table versus compacted blocks, for values
+// that change every second and for values that never change.
+describe.skipIf(!process.env.TSDB_BENCH_CODEC)("storage cost per sample", () => {
+	it("compares head rows with compacted blocks", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "tsdb-bench-codec-"));
+		const store = await MetricsStore.open({
+			location: { kind: "node-file", directory: dir },
+			wasmBinary: WASM,
+		});
+		try {
+			const series = 200;
+			const nowMs = Date.now();
+			const startMs = nowMs - 26 * HOUR;
+			const labels = Array.from({ length: series }, (_, i) => ({
+				__name__: i < series / 2 ? "changing" : "constant",
+				job: "bench",
+				idx: String(i),
+			}));
+			const batches = HOUR / (BATCH_SECONDS * STEP_MS);
+			for (let b = 0; b < batches; b++) {
+				const samples = [];
+				for (let s = 0; s < BATCH_SECONDS; s++) {
+					const ts = startMs + (b * BATCH_SECONDS + s) * STEP_MS;
+					for (let i = 0; i < series; i++) {
+						const value = i < series / 2 ? Math.sin(ts / 60000 + i) * 100 + i : 42;
+						samples.push({ labels: labels[i], ts, value });
+					}
+				}
+				await store.ingest(samples);
+			}
+			const internals = store as unknown as { sqlite3: any; db: number };
+			const query = async (sql: string) => {
+				let out: unknown[] = [];
+				await internals.sqlite3.exec(internals.db, sql, (row: unknown[]) => { out = row; });
+				return out;
+			};
+			const pageSize = Number((await query("PRAGMA page_size"))[0]);
+			const livePages = async () =>
+				Number((await query("PRAGMA page_count"))[0]) -
+				Number((await query("PRAGMA freelist_count"))[0]);
+			const headRows = Number((await query("SELECT count(*) FROM samples_head"))[0]);
+			const pagesWithHead = await livePages();
+			let result;
+			do {
+				result = await store.compactBeforeBatch(nowMs, 2048);
+			} while (!result.complete);
+			const pagesWithBlocks = await livePages();
+			const [blockCount, blockPoints, payloadBytes] = await query(
+				"SELECT count(*), sum(sample_count), sum(length(payload)) FROM samples_blocks"
+			);
+			const perName = [];
+			for (const name of ["changing", "constant"]) {
+				const row = await query(
+					`SELECT sum(b.sample_count), sum(length(b.payload)) FROM samples_blocks b
+					 JOIN series s ON s.id = b.series_id WHERE s.labels_json LIKE '%"${name}"%'`
+				);
+				perName.push(`${name}: ${(Number(row[1]) / Number(row[0])).toFixed(2)} B/sample payload`);
+			}
+			log(
+				`codec: headRows=${headRows} livePagesWithHead=${pagesWithHead} (${((pagesWithHead * pageSize) / headRows).toFixed(1)} B/sample as hot rows) | ` +
+					`after compaction: blocks=${blockCount} points=${blockPoints} livePages=${pagesWithBlocks} (${((pagesWithBlocks * pageSize) / Number(blockPoints)).toFixed(2)} B/sample on pages, ` +
+					`${(Number(payloadBytes) / Number(blockPoints)).toFixed(2)} B/sample payload) | ${perName.join(", ")}`
+			);
+			expect(result.complete).toBe(true);
+		} finally {
+			await store.close();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 900_000);
+});

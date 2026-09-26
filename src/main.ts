@@ -29,12 +29,14 @@ import {
 	MetricsStore,
 	MetricsStoreLike,
 	QuickStoreStats,
+	STORE_SIZE_GUARD_BYTES,
 	StoredSample,
 } from "./storage/store";
 import {
 	COMPACTION_BACKLOG_RETRY_MS,
 	COMPACTION_BATCH_MAX_POINTS,
 	COMPACTION_BATCH_PAUSE_MS,
+	COMPACTION_HOT_WINDOW_MS,
 	COMPACTION_MAX_BATCHES_PER_SWEEP,
 	COMPACTION_SWEEP_MS,
 	compactionPauseMs,
@@ -91,6 +93,8 @@ declare global {
 
 const WAL_FILENAME = "metrics.wal";
 const RETENTION_SWEEP_MS = 60 * 60 * 1000; // hourly
+const SIZE_GUARD_INTERVAL_MS = 5 * 60 * 1000;
+const SIZE_GUARD_MIN_INTERVAL_MS = 10 * 60 * 1000;
 const STARTUP_RETENTION_DELAY_MS = 60 * 1000;
 const WORKER_OPFS_START_ATTEMPTS = 2;
 const WORKER_OPFS_RETRY_DELAY_MS = 5000;
@@ -152,6 +156,8 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private lastInteractiveQueryAtMs = Number.NEGATIVE_INFINITY;
 	private lastInteractiveQueryQueueWaitMs = 0;
 	private vacuumPageLimit = VACUUM_BATCH_INITIAL_PAGES;
+	private sizeGuardTimer: number | null = null;
+	private lastSizeGuardMs = Number.NEGATIVE_INFINITY;
 	private markdownRefreshScheduled = false;
 	private inFlightIngests = new Set<Promise<void>>();
 	private storeHealth: IngestHealth = {
@@ -974,7 +980,45 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			() => this.pruneOldSamples(),
 			RETENTION_SWEEP_MS
 		);
+		this.sizeGuardTimer = window.setInterval(
+			() => void this.checkStoreSize(),
+			SIZE_GUARD_INTERVAL_MS
+		);
 		this.scheduleCompaction(STARTUP_COMPACTION_DELAY_MS);
+	}
+
+	/**
+	 * A store past the size guard means retention or compaction fell behind
+	 * their timers; run both now rather than waiting for the next tick.
+	 */
+	private async checkStoreSize(): Promise<void> {
+		if (!this.store || this.isUnloading) return;
+		let stats: QuickStoreStats;
+		try {
+			stats = await this.store.quickStats();
+		} catch {
+			return;
+		}
+		if (stats.sizeBytes < STORE_SIZE_GUARD_BYTES) return;
+		this.forceMaintenance("size", stats.sizeBytes);
+	}
+
+	private forceMaintenance(reason: "size" | "full", sizeBytes?: number): void {
+		const now = Date.now();
+		if (now - this.lastSizeGuardMs < SIZE_GUARD_MIN_INTERVAL_MS) return;
+		this.lastSizeGuardMs = now;
+		this.tsdbMetrics?.recordStoreSizeGuard(reason);
+		console.warn(
+			`tsdb: store ${reason === "full" ? "is full" : "crossed the size guard"}` +
+				(sizeBytes !== undefined ? ` (${Math.round(sizeBytes / 1048576)} MiB)` : "") +
+				"; forcing retention and compaction"
+		);
+		this.pruneOldSamples();
+		if (this.compactionTimer !== null) {
+			window.clearTimeout(this.compactionTimer);
+			this.compactionTimer = null;
+		}
+		this.scheduleCompaction(0);
 	}
 
 	private clearMaintenanceTimers(): void {
@@ -986,10 +1030,12 @@ export default class ObsidianMetricsPlugin extends Plugin {
 		if (this.compactionTimer !== null) {
 			window.clearTimeout(this.compactionTimer);
 		}
+		if (this.sizeGuardTimer !== null) window.clearInterval(this.sizeGuardTimer);
 		this.flushTimer = null;
 		this.retentionTimer = null;
 		this.startupRetentionTimer = null;
 		this.compactionTimer = null;
+		this.sizeGuardTimer = null;
 	}
 
 	private scheduleCompaction(delayMs: number): void {
@@ -1010,7 +1056,9 @@ export default class ObsidianMetricsPlugin extends Plugin {
 	private compactClosedBuckets(): void {
 		if (!this.store || this.compactionSweepPromise) return;
 		const store = this.store;
-		const cutoffMs = Date.now();
+		// Everything older than the hot window is compactable, open bucket
+		// included; raw rows only ever cover the last few minutes.
+		const cutoffMs = Date.now() - COMPACTION_HOT_WINDOW_MS;
 		const sweep = this.runCompactionSweep(store, cutoffMs);
 		this.compactionSweepPromise = sweep;
 		void sweep
@@ -1055,6 +1103,7 @@ export default class ObsidianMetricsPlugin extends Plugin {
 					this.compactionPointLimit
 				);
 				const durationMs = performance.now() - started;
+				this.tsdbMetrics?.recordDroppedBlocks(result.droppedCorruptBlocks);
 				this.compactionBacklogAgeMs =
 					result.oldestUncompactedMs === null
 						? 0
@@ -1287,6 +1336,9 @@ export default class ObsidianMetricsPlugin extends Plugin {
 			);
 			this.storeHealth.lastIngestError = String(error);
 			this.storeHealth.lastIngestErrorMs = Date.now();
+			if (/full/i.test(String(error))) {
+				this.forceMaintenance("full");
+			}
 			throw error;
 		}
 	}

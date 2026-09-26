@@ -153,7 +153,8 @@ def run_seed(extension: str, seed: int, operations: int) -> None:
                     (encode_batch(rows),),
                 )
             elif choice < 78:
-                cutoff = rng.randrange(1, 23) * 10_000
+                # Any cutoff is legal, aligned to the block span or not.
+                cutoff = rng.randrange(1, 2301) * 100
                 db.execute(
                     "INSERT INTO samples(control,arg1,arg2) "
                     "VALUES('compact-before',?,?)",
